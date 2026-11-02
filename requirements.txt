@@ -1,0 +1,6 @@
+anthropic==2.3.0
+feedparser==6.0.14
+pillow==13.0.0
+requests==2.34.2
+python-dotenv==1.2.4
+typesafe-sdk==0.7.5

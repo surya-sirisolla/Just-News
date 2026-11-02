@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+logs/
+reports/
+# PicoClaw runtime state (config with secrets is rendered here at launch)
+picoclaw/home/
+picoclaw/workspace/sessions/
+picoclaw/workspace/state/
+picoclaw/workspace/memory/
+picoclaw/workspace/cron/
+picoclaw/workspace/.*
+picoclaw/bin/
+output/

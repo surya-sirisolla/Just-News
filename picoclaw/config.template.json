@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "agents": {
+    "defaults": {
+      "workspace": "${JUSTNEWS_PICOCLAW_WORKSPACE}",
+      "restrict_to_workspace": true,
+      "allow_read_outside_workspace": false,
+      "model_name": "just-news-orchestrator",
+      "max_tokens": 8192,
+      "max_tool_iterations": 12,
+      "max_llm_retries": 2,
+      "llm_retry_backoff_secs": 4
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "just-news-orchestrator",
+      "provider": "${PICOCLAW_PROVIDER}",
+      "model": "${PICOCLAW_MODEL}",
+      "api_base": "${PICOCLAW_API_BASE}",
+      "extra_body": ${PICOCLAW_EXTRA_BODY}
+    }
+  ],
+  "heartbeat": { "enabled": false, "interval": 30 },
+  "tools": {
+    "exec": {
+      "enabled": true,
+      "enable_deny_patterns": true,
+      "allow_remote": false,
+      "timeout_seconds": 300
+    },
+    "cron": { "enabled": true, "exec_timeout_minutes": 10, "allow_command": true },
+    "web": { "enabled": false },
+    "install_skill": { "enabled": false },
+    "find_skills": { "enabled": false },
+    "send_file": { "enabled": false },
+    "spawn": { "enabled": false },
+    "subagent": { "enabled": false }
+  }
+}
