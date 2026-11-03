@@ -1,0 +1,19 @@
+[Unit]
+Description=Just News (WhatsApp bridge + hourly news cycle + Instagram publishing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=justnews
+WorkingDirectory=/opt/justnews
+ExecStart=/opt/justnews/.venv/bin/python -m justnews serve
+Restart=always
+RestartSec=15
+# Secrets come from /opt/justnews/.env (mode 600, never in git). On EC2 the S3 access comes
+# from the instance's IAM role, so .env needs no AWS keys there.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

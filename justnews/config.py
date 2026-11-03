@@ -111,7 +111,10 @@ class Settings:
     whatsapp_owner: str = field(default_factory=lambda: os.getenv("WHATSAPP_OWNER_NUMBER", "").lstrip("+").replace(" ", ""))
     whatsapp_session: Path = field(default_factory=lambda: Path(os.getenv(
         "WHATSAPP_SESSION_PATH", PROJECT_ROOT / "data" / "whatsapp-session.sqlite3")))
-    approval_expiry_hours: float = field(default_factory=lambda: _float("JUSTNEWS_APPROVAL_EXPIRY_HOURS", 12.0))
+    approval_expiry_hours: float = field(default_factory=lambda: _float("JUSTNEWS_APPROVAL_EXPIRY_HOURS", 1.0))
+    # `serve` runs a news cycle this often; an unanswered shortlist is replaced by the next one.
+    cycle_minutes: int = field(default_factory=lambda: _int("JUSTNEWS_CYCLE_MINUTES", 60))
+    timezone: str = field(default_factory=lambda: os.getenv("JUSTNEWS_TIMEZONE", "Asia/Kolkata"))
     # Free-tier Gemini models for chatting with the owner, fastest first (replies should feel instant).
     gemini_chat_models: list[str] = field(default_factory=lambda: _list(
         "GEMINI_CHAT_MODELS", ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"]))

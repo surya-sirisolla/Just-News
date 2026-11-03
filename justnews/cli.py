@@ -12,6 +12,7 @@ PicoClaw skills call), or both together with `run`.
   python -m justnews publish  [RUN_ID]   # Agent 5: post approved templates to Instagram
   python -m justnews run                 # agents 1-3, then the approval request (or agent 4 if
                                          # WhatsApp isn't configured), then the report
+  python -m justnews serve [--every 60]  # production: WhatsApp bridge + a news cycle every hour
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import argparse
 import json
 import logging
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -171,8 +174,9 @@ def cmd_report(db: Database, args) -> str:
     return run_id
 
 
-def cmd_run(db: Database, args) -> str:
-    run_id = args.run_id or new_run_id()
+def run_cycle(db: Database, run_id: str | None = None) -> str:
+    """Agents 1-3, then the WhatsApp shortlist (or Agent 4 for every draft without WhatsApp)."""
+    run_id = run_id or new_run_id()
     NewsDiscoveryAgent(settings, db).run(run_id)
     NewsEvaluatorAgent(settings, db).run(run_id)
     try:
@@ -184,8 +188,40 @@ def cmd_run(db: Database, args) -> str:
         approval_service(db).request(run_id)
     else:
         ImageDesignerAgent(settings, db).run(run_id)
-    args.run_id = run_id
+    REPORTS_DIR.mkdir(exist_ok=True)
+    (REPORTS_DIR / f"run-{run_id}.md").write_text(render(build_report(db, run_id), "md"), encoding="utf-8")
+    return run_id
+
+
+def cmd_run(db: Database, args) -> str:
+    args.run_id = run_cycle(db, args.run_id)
     return cmd_report(db, args)
+
+
+def scheduler(every_minutes: int, stop: threading.Event) -> None:
+    """Run a news cycle now and then every `every_minutes`, on its own database connection."""
+    db = Database(settings.db_path)
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            run_id = run_cycle(db)
+            log.info("Scheduled cycle %s finished in %.0fs", run_id, time.monotonic() - started)
+        except Exception:  # keep the schedule alive; the next cycle may succeed
+            log.exception("Scheduled news cycle failed")
+        stop.wait(max(60, every_minutes * 60 - (time.monotonic() - started)))
+
+
+def cmd_serve(db: Database, args) -> str:
+    """The production service: WhatsApp bridge plus an hourly news cycle, in one process."""
+    if not settings.whatsapp_enabled:
+        raise SystemExit("Set WHATSAPP_OWNER_NUMBER in .env first.")
+    stop = threading.Event()
+    threading.Thread(target=scheduler, args=(args.every, stop), name="scheduler", daemon=True).start()
+    log.info("Serving: news cycle every %d minutes, WhatsApp approvals from %s", args.every, settings.whatsapp_owner)
+    try:
+        return cmd_whatsapp(db, args)
+    finally:
+        stop.set()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -201,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("reply", help='apply an approval reply, e.g. reply "1 3"')
     p.add_argument("text")
     p.set_defaults(func=cmd_reply)
+    p = sub.add_parser("serve", help="production: WhatsApp bridge + a news cycle every --every minutes")
+    p.add_argument("--every", type=int, default=settings.cycle_minutes, help="minutes between cycles")
+    p.add_argument("--pair-code", metavar="SPARE_NUMBER", default=None, help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_serve)
     p = sub.add_parser("whatsapp", help="run the WhatsApp bridge (links a spare number on first run)")
     p.add_argument("--pair-code", metavar="SPARE_NUMBER", default=None,
                    help="link with a pairing code for this number instead of scanning a QR code")

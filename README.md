@@ -279,15 +279,35 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
    shorter version: the headline, 1–2 hashtags and "Source: BBC News". Leaving the URL out keeps
    each post at $0.015.
 
-## Scheduling (later)
+## Running every hour
 
-PicoClaw has a built-in scheduler. For example, to run every 4 hours:
+`python -m justnews serve` is the production process. It holds the WhatsApp connection and runs a
+news cycle **every hour** (`JUSTNEWS_CYCLE_MINUTES`): discover, evaluate, write posts, then send
+you a numbered shortlist.
+- **Reply with numbers:** those stories are designed and posted to Instagram, and the bot replies
+  with the links.
+- **Don't reply:** the list is ignored. The next hour's list replaces it, and those stories are
+  never offered again; discovery only brings news not seen before.
+- **Nothing new:** if a cycle finds no new recommended stories, no message is sent.
 
-```bash
-scripts/picoclaw.sh cron add -n news-cycle -c '0 */4 * * *' -m "Run the Just News news cycle now."
-```
+It runs the cycle directly in Python rather than through PicoClaw's cron, which would add a Claude
+orchestrator call every hour (about $15/month). PicoClaw remains available for on-demand runs.
 
-You could also add a system cron entry for `.venv/bin/python -m justnews run`. Neither is set up yet.
+## Deploying to AWS (EC2 + GitHub Actions)
+
+- **The server:** an EC2 instance runs `serve` as a systemd service (`deploy/justnews.service`).
+  It only makes outbound connections, so **no inbound ports** are needed. SSH is limited to your
+  IP, for setup only.
+- **S3:** access comes from the instance's **IAM role**, so the server's `.env` has no AWS keys.
+- **CI/CD:** every push to `main` runs the tests on GitHub Actions. If they pass, the workflow
+  deploys through **AWS Systems Manager** (`.github/workflows/deploy.yml`, which runs
+  `deploy/deploy.sh`). GitHub signs in to AWS with OIDC: no SSH keys or AWS secrets are stored in
+  GitHub, and no port is opened for it.
+- **First install:** run `deploy/setup-server.sh` on a fresh Ubuntu 24.04 instance, copy `.env`
+  and `data/` (the WhatsApp session and history) to `/opt/justnews`, then
+  `systemctl start justnews`.
+- **One WhatsApp connection:** only one place may run the bridge at a time, so stop it on your Mac
+  before starting the server.
 
 ## Known limitations
 

@@ -19,6 +19,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Callable
 
 from .config import Settings
@@ -102,9 +103,11 @@ class ApprovalService:
         items = json.loads(req["items"])
         posts = {p["article_id"]: p for p in self.db.posts_for_run(req["run_id"])}
         blocks = [self._format_item(n, posts[aid]) for n, aid in items.items() if aid in posts]
-        header = f"📰 *Just News* – {len(blocks)} stories ready to post"
-        footer = (f"Reply with the numbers to create a template and post, e.g. *1 3* or *1-3*, "
-                  f"or *all* / *none*. This list expires in {self.settings.approval_expiry_hours:g} hours.")
+        local = datetime.now(ZoneInfo(self.settings.timezone)).strftime("%-I:%M %p")
+        header = f"📰 *Just News* · {local} – {len(blocks)} new stories"
+        footer = (f"Reply with the numbers to post, e.g. *1 3* or *1-3*, or *all* / *none*. "
+                  f"If you skip this list, it's ignored and the next one comes in about "
+                  f"{_duration(self.settings.cycle_minutes)}.")
         for text in _chunks([header] + blocks, footer):
             self._send(text)
         self.db.set_approval_status(request_id, "sent")
@@ -273,6 +276,10 @@ class ApprovalService:
     def _reply(self, text: str, outcome: str) -> str:
         self._send(text)
         return outcome
+
+
+def _duration(minutes: int) -> str:
+    return f"{minutes // 60} hour{'s' if minutes >= 120 else ''}" if minutes % 60 == 0 else f"{minutes} minutes"
 
 
 def _join(numbers: list[int]) -> str:
