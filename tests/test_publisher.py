@@ -184,7 +184,14 @@ class PublisherTests(unittest.TestCase):
         self.db.set_post_approval([self.ids[1]], "approved")
         for _ in range(3):
             self.db.save_publication(self.ids[1], "instagram", "failed", error="boom")
-        self.assertEqual(self.db.failed_publications("instagram", 3), [])
+        self.assertEqual(self.db.failed_publications("instagram", 3, 6), [])
+
+    def test_old_failures_are_not_retried(self):
+        self.db.set_post_approval([self.ids[1]], "approved")
+        self.db.save_publication(self.ids[1], "instagram", "failed", error="no credits")
+        self.assertEqual(len(self.db.failed_publications("instagram", 3, 6)), 1)
+        self.db.conn.execute("UPDATE publications SET updated_at = '2026-01-01T00:00:00+00:00'")
+        self.assertEqual(self.db.failed_publications("instagram", 3, 6), [])
 
     def test_transient_read_errors_are_retried(self):
         result = self.publisher(FakeGraph(flaky_gets=2)).publish("r1", [self.ids[0]])
@@ -199,7 +206,7 @@ class PublisherTests(unittest.TestCase):
         pub = self.publisher()
         service = ApprovalService(self.settings, self.db, OutboxClient(self.db),
                                   designer=lambda run_id, ids: NS(photos=0, graphics=len(ids), failed=0),
-                                  publisher=pub.publish)
+                                  publishers={"Instagram": pub.publish})
         service.request("r1")
         self.assertEqual(service.handle_message(Incoming("m1", "919800000001", "1 2", 0)), "approved 1, 2, posted 2")
         reply = [r[0] for r in self.db.conn.execute("SELECT body FROM wa_outbox ORDER BY id")][-1]

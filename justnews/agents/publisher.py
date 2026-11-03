@@ -1,14 +1,15 @@
-"""Agent 5 - Publisher: posts owner-approved templates to Instagram.
+"""Agent 5 - Publisher: posts owner-approved templates to Instagram (and X, see x_publisher.py).
 
 Runs only for posts the owner approved on WhatsApp (or explicitly via `python -m justnews publish`).
-For each post:
+`Publisher` holds what every platform shares: each post is published at most once (the
+`publications` table), a daily cap, a stop on token errors, and next-cycle retries that first check
+whether a "failed" post actually went live. On Instagram, for each post:
   1. convert the template to JPEG (the only image format Instagram accepts)
   2. upload it to a private S3 bucket and create a temporary (1-hour) link
   3. POST /<IG_ID>/media with image_url + caption -> a media container; wait until Instagram has
      fetched the image (status FINISHED)
   4. POST /<IG_ID>/media_publish -> the live post; read its permalink
-Each post is published at most once (the `publications` table), and posting stops at
-JUSTNEWS_MAX_POSTS_PER_DAY, well under Instagram's 100 API posts per 24 hours.
+Posting stops at JUSTNEWS_MAX_POSTS_PER_DAY, well under Instagram's 100 API posts per 24 hours.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ URL_LIFETIME = 3600
 POLL_SECONDS, POLL_ATTEMPTS = 3, 20
 TIMEOUT = 60
 MAX_ATTEMPTS = 3  # a failed post is retried in later cycles up to this many times
+RETRY_HOURS = 6   # ...but only while the news is fresh; older failures are left alone
 
 
 class PublishError(Exception):
@@ -87,19 +89,116 @@ class PublishResult:
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (article_id, reason)
 
 
-class InstagramPublisher:
-    name = "publisher"
+class Publisher:
+    """Shared publishing loop; subclasses post one story and look up recent posts on the account."""
 
-    def __init__(self, settings: Settings, db: Database, store=None, session=None, sleep=time.sleep):
+    name = "publisher"
+    platform = ""  # key in the publications table
+    label = ""     # shown to the owner
+
+    def __init__(self, settings: Settings, db: Database, sleep=time.sleep):
         self.settings = settings
         self.db = db
+        self.sleep = sleep
+
+    def remaining_quota(self) -> int | None:
+        """Posts the platform itself still allows today; None when it doesn't say."""
+        return None
+
+    def _publish_one(self, run_id: str, p) -> tuple[str, str]:
+        raise NotImplementedError
+
+    def _recent_media(self) -> list[dict]:
+        raise NotImplementedError
+
+    def _find_live(self, p, recent: list[dict] | None = None) -> tuple[str, str] | None:
+        raise NotImplementedError
+
+    def publish(self, run_id: str, article_ids: list[str]) -> PublishResult:
+        result = PublishResult()
+        posts = {p["article_id"]: p for p in self.db.posts_for_run(run_id)}
+        budget = self.settings.max_posts_per_day - self.db.published_since(self.platform, 24)
+        try:
+            quota = self.remaining_quota()
+        except PublishError as exc:
+            log.error("%s quota check failed: %s", self.label, exc)
+            result.failed += [(aid, str(exc)) for aid in article_ids]
+            return result
+        if quota is not None:
+            budget = min(budget, quota)
+        for aid in article_ids:
+            p = posts.get(aid)
+            done = self.db.publication(aid, self.platform)
+            if done and done["status"] == "published":
+                result.skipped.append((aid, "already posted"))
+                continue
+            if p is None or not p["image_path"] or not Path(p["image_path"]).exists():
+                result.failed.append((aid, "no template image"))
+                continue
+            if budget <= 0:
+                result.skipped.append((aid, f"daily limit of {self.settings.max_posts_per_day} posts reached"))
+                continue
+            try:
+                media_id, link = self._publish_one(run_id, p)
+            except PublishError as exc:
+                log.error("  %s post failed for %r: %s", self.label, p["headline"][:60], exc)
+                self.db.save_publication(aid, self.platform, "failed", error=str(exc))
+                result.failed.append((aid, str(exc)))
+                if exc.fatal:
+                    result.failed += [(a, "not attempted after a token/permission error")
+                                      for a in article_ids[article_ids.index(aid) + 1:]]
+                    break
+                continue
+            self.db.save_publication(aid, self.platform, "published", media_id=media_id, permalink=link)
+            result.posted.append((aid, link))
+            budget -= 1
+            log.info("  posted to %s: %s", self.label, link)
+        return result
+
+    def retry_failed(self) -> PublishResult:
+        """Next-cycle retry of approved posts that failed. Anything that actually went live is first
+        reconciled as posted, so a retry never duplicates a post."""
+        result = PublishResult()
+        failed = self.db.failed_publications(self.platform, MAX_ATTEMPTS, RETRY_HOURS)
+        if not failed:
+            return result
+        try:
+            recent = self._recent_media()
+        except PublishError as exc:
+            log.warning("Could not check %s before retrying: %s", self.label, exc)
+            return result
+        retry: dict[str, list[str]] = {}
+        for row in failed:
+            p = next((x for x in self.db.posts_for_run(row["run_id"]) if x["article_id"] == row["article_id"]), None)
+            if p is None:
+                continue
+            live = self._find_live(p, recent)
+            if live:
+                self.db.save_publication(p["article_id"], self.platform, "published", media_id=live[0], permalink=live[1])
+                result.posted.append((p["article_id"], live[1]))
+                log.info("  reconciled: %r was already live at %s", p["headline"][:50], live[1])
+            else:
+                retry.setdefault(row["run_id"], []).append(p["article_id"])
+        for run_id, ids in retry.items():
+            again = self.publish(run_id, ids)
+            result.posted += again.posted
+            result.failed += again.failed
+            result.skipped += again.skipped
+        return result
+
+
+class InstagramPublisher(Publisher):
+    platform = PLATFORM
+    label = "Instagram"
+
+    def __init__(self, settings: Settings, db: Database, store=None, session=None, sleep=time.sleep):
+        super().__init__(settings, db, sleep)
         self.store = store or S3MediaStore(settings.s3_bucket, settings.aws_region)
         self.session = session or requests.Session()
         # Token in a header, never in URLs or logs.
         self.session.headers["Authorization"] = f"Bearer {settings.instagram_token}"
         self.base = f"https://graph.facebook.com/{settings.instagram_api_version}"
         self.ig = settings.instagram_user_id
-        self.sleep = sleep
 
     # --- Graph API ----------------------------------------------------------------
     def _call(self, method: str, path: str, retries: int = 0, **data) -> dict:
@@ -140,45 +239,6 @@ class InstagramPublisher:
         return data["config"]["quota_total"] - data["quota_usage"]
 
     # --- publishing -------------------------------------------------------------------
-    def publish(self, run_id: str, article_ids: list[str]) -> PublishResult:
-        result = PublishResult()
-        posts = {p["article_id"]: p for p in self.db.posts_for_run(run_id)}
-        budget = self.settings.max_posts_per_day - self.db.published_since(PLATFORM, 24)
-        try:
-            budget = min(budget, self.remaining_quota())
-        except PublishError as exc:
-            log.error("Instagram quota check failed: %s", exc)
-            result.failed += [(aid, str(exc)) for aid in article_ids]
-            return result
-        for aid in article_ids:
-            p = posts.get(aid)
-            done = self.db.publication(aid, PLATFORM)
-            if done and done["status"] == "published":
-                result.skipped.append((aid, "already posted"))
-                continue
-            if p is None or not p["image_path"] or not Path(p["image_path"]).exists():
-                result.failed.append((aid, "no template image"))
-                continue
-            if budget <= 0:
-                result.skipped.append((aid, f"daily limit of {self.settings.max_posts_per_day} posts reached"))
-                continue
-            try:
-                media_id, link = self._publish_one(run_id, p)
-            except PublishError as exc:
-                log.error("  Instagram post failed for %r: %s", p["headline"][:60], exc)
-                self.db.save_publication(aid, PLATFORM, "failed", error=str(exc))
-                result.failed.append((aid, str(exc)))
-                if exc.fatal:
-                    result.failed += [(a, "not attempted after a token/permission error")
-                                      for a in article_ids[article_ids.index(aid) + 1:]]
-                    break
-                continue
-            self.db.save_publication(aid, PLATFORM, "published", media_id=media_id, permalink=link)
-            result.posted.append((aid, link))
-            budget -= 1
-            log.info("  posted to Instagram: %s", link)
-        return result
-
     def _publish_one(self, run_id: str, p) -> tuple[str, str]:
         key = f"posts/{run_id}/{p['article_id']}.jpg"
         try:
@@ -217,34 +277,3 @@ class InstagramPublisher:
         except Exception:
             log.warning("  could not delete %s from S3 (the lifecycle rule will)", key)
         return media_id, link
-
-    def retry_failed(self) -> PublishResult:
-        """Next-cycle retry of approved posts that failed. Anything that actually went live is first
-        reconciled as posted, so a retry never duplicates a post."""
-        result = PublishResult()
-        failed = self.db.failed_publications(PLATFORM, MAX_ATTEMPTS)
-        if not failed:
-            return result
-        try:
-            recent = self._recent_media()
-        except PublishError as exc:
-            log.warning("Could not check Instagram before retrying: %s", exc)
-            return result
-        retry: dict[str, list[str]] = {}
-        for row in failed:
-            p = next((x for x in self.db.posts_for_run(row["run_id"]) if x["article_id"] == row["article_id"]), None)
-            if p is None:
-                continue
-            live = self._find_live(p, recent)
-            if live:
-                self.db.save_publication(p["article_id"], PLATFORM, "published", media_id=live[0], permalink=live[1])
-                result.posted.append((p["article_id"], live[1]))
-                log.info("  reconciled: %r was already live at %s", p["headline"][:50], live[1])
-            else:
-                retry.setdefault(row["run_id"], []).append(p["article_id"])
-        for run_id, ids in retry.items():
-            again = self.publish(run_id, ids)
-            result.posted += again.posted
-            result.failed += again.failed
-            result.skipped += again.skipped
-        return result

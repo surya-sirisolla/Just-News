@@ -129,9 +129,20 @@ class Settings:
     # Our own cap, well under Instagram's 100 API posts per 24 hours.
     max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 10))
 
+    # X (API v2) with OAuth 1.0a keys for the posting account itself. Posting needs Pay-Per-Use
+    # credits on console.x.com. Publishing is on when all four are set.
+    x_api_key: str = field(default_factory=lambda: os.getenv("X_API_KEY", "").strip())
+    x_api_secret: str = field(default_factory=lambda: os.getenv("X_API_SECRET", "").strip())
+    x_access_token: str = field(default_factory=lambda: os.getenv("X_ACCESS_TOKEN", "").strip())
+    x_access_token_secret: str = field(default_factory=lambda: os.getenv("X_ACCESS_TOKEN_SECRET", "").strip())
+
     @property
     def instagram_enabled(self) -> bool:
         return bool(self.instagram_token and self.instagram_user_id and self.s3_bucket)
+
+    @property
+    def x_enabled(self) -> bool:
+        return bool(self.x_api_key and self.x_api_secret and self.x_access_token and self.x_access_token_secret)
 
     @property
     def whatsapp_enabled(self) -> bool:

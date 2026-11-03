@@ -189,7 +189,8 @@ justnews/
   agents/images.py      Agent 4 (Wikimedia Commons search, licence filter)
   graphics.py           Pillow layouts: white text graphic, photo with overlay
   jev.py                TypeSafe Jev: scoring, duplicate checks, post review, photo choice
-  agents/publisher.py   Agent 5: Instagram publishing (S3 presigned link, container, publish)
+  agents/publisher.py   Agent 5: shared publishing loop + Instagram (S3 presigned link, container, publish)
+  agents/x_publisher.py Agent 5 on X: media upload + post, OAuth 1.0a signing, 280-character text
   approval.py           WhatsApp approval: shortlist, reply parsing, design + post on approval
   assistant.py          natural-language replies on WhatsApp (Gemini free tier, keyword fallback)
   whatsapp.py           linked-device WhatsApp bridge (QR link, outbox sender, owner filter)
@@ -260,32 +261,45 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
 5. **Safeguards:** each story is posted once, at most `JUSTNEWS_MAX_POSTS_PER_DAY` (10) per day
    (Instagram allows 100). The caption includes the photo credit for licensed photos.
 
-### X / Twitter (X API v2)
+### X / Twitter (built: `justnews/agents/x_publisher.py`)
 
 1. **Developer account:** sign in to console.x.com as the Just News X account, accept the
    developer agreement, and create an app.
 2. **App permissions:** in User authentication settings, set the app permissions to **Read and
-   write**, with the type "Web App, Automated App or Bot". Any callback URL works, e.g.
-   `http://localhost`.
-3. **Keys and tokens:** generate the API key and secret, then the access token and secret for
-   your account. Generate the tokens *after* setting Read and write, or they stay read-only.
-4. **Credits:** X has no free posting tier. It's pay-per-use: about **$0.015 per post**, but
-   **$0.20 per post that contains a link**. Buy credits in the console, set a monthly spending
-   limit, and leave auto-recharge off at first.
+   write**, with the type "Web App, Automated App or Bot". The callback and website URLs aren't
+   used (the publisher never signs anyone in), but the form needs them: the GitHub repo URL works.
+3. **Keys and tokens:** generate the API key and secret (Consumer Keys), then the access token and
+   secret for your account. Generate the tokens *after* setting Read and write, or they stay
+   read-only. The OAuth 2.0 Client ID/Secret and the bearer token are not used.
+   Alternatively, with only the API key and secret, authorise the app through X's PIN flow
+   (`oauth/request_token` with `oauth_callback=oob`, open the authorize link, then exchange the
+   PIN at `oauth/access_token`).
+4. **Credits:** X has no free posting tier. Without credits, every call answers 403
+   `client-not-enrolled`, which the bot reports as "X needs Pay-Per-Use credits". Posting is
+   pay-per-use: **$0.015 per post**, but **$0.20 per post that contains a link**. Buy credits in
+   the console (Billing), set a monthly spending limit, and leave auto-recharge off at first.
+   Ten posts a day comes to about $5 a month.
 5. **`.env`:** set `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and `X_ACCESS_TOKEN_SECRET`.
-6. **What the publisher will do:** upload the image with `POST https://api.x.com/2/media/upload`
-   (`media_category=tweet_image`), then post with `POST https://api.x.com/2/tweets` (text plus
-   `media.media_ids`). The text must fit 280 characters (a link counts as 23), so X gets a
-   shorter version: the headline, 1–2 hashtags and "Source: BBC News". Leaving the URL out keeps
-   each post at $0.015.
+   X publishing switches on when all four are set; approvals then post to Instagram *and* X, and
+   the WhatsApp reply lists the links (or the reason) per platform.
+6. **How each post goes out:** the JPEG is uploaded with `POST https://api.x.com/2/media/upload`
+   (`media_category=tweet_image`), then posted with `POST https://api.x.com/2/tweets` (text plus
+   `media.media_ids`). Requests are signed with OAuth 1.0a (HMAC-SHA1).
+7. **The text:** headline, caption, up to three hashtags and "Source: BBC News" (plus the photo
+   credit for licensed photos), within 280 characters as X counts them. When it's too long, the
+   caption is dropped first, then hashtags. Links and bare domains ("Reuters.com") are removed,
+   which keeps each post at $0.015.
+8. **Safeguards:** the same as Instagram: each story is posted once, at most
+   `JUSTNEWS_MAX_POSTS_PER_DAY` per day, and a timed-out post is looked up on the account before
+   any retry. X also refuses identical text, which the publisher treats as "already posted".
 
 ## Running every hour
 
 `python -m justnews serve` is the production process. It holds the WhatsApp connection and runs a
 news cycle **every hour** (`JUSTNEWS_CYCLE_MINUTES`): discover, evaluate, write posts, then send
 you a numbered shortlist.
-- **Reply with numbers:** those stories are designed and posted to Instagram, and the bot replies
-  with the links.
+- **Reply with numbers:** those stories are designed and posted to Instagram and X (whichever are
+  connected), and the bot replies with the links.
 - **Don't reply:** the list is ignored. The next hour's list replaces it, and those stories are
   never offered again; discovery only brings news not seen before.
 - **Nothing new:** if a cycle finds no new recommended stories, no message is sent.

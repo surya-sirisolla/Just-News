@@ -30,7 +30,8 @@ from .agents.content import ContentCreatorAgent
 from .agents.discovery import NewsDiscoveryAgent
 from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
-from .agents.publisher import InstagramPublisher
+from .agents.publisher import InstagramPublisher, Publisher
+from .agents.x_publisher import XPublisher
 from .approval import ApprovalService
 from .assistant import Assistant
 from .whatsapp import Incoming, OutboxClient, WhatsAppBridge, WhatsAppError, bridge_running
@@ -97,6 +98,16 @@ class ConsoleClient:
         return f"console-{uuid.uuid4().hex[:12]}"
 
 
+def make_publishers(db: Database) -> list[Publisher]:
+    """Every platform whose keys are set, in the order posts go out."""
+    publishers: list[Publisher] = []
+    if settings.instagram_enabled:
+        publishers.append(InstagramPublisher(settings, db))
+    if settings.x_enabled:
+        publishers.append(XPublisher(settings, db))
+    return publishers
+
+
 def approval_service(db: Database) -> ApprovalService:
     def designer(run_id: str, article_ids: list[str]):
         return ImageDesignerAgent(settings, db).run(run_id, article_ids)
@@ -106,15 +117,12 @@ def approval_service(db: Database) -> ApprovalService:
         assistant = Assistant([GeminiClient(settings.gemini_api_key, m, 0.0, 0.0, thinking_level="minimal",
                                             min_interval=settings.gemini_min_interval, temperature=0.6,
                                             timeout=20, retries=0) for m in settings.gemini_chat_models])
-    publisher = None
-    if settings.instagram_enabled:
-        def publisher(run_id: str, article_ids: list[str]):
-            return InstagramPublisher(settings, db).publish(run_id, article_ids)
+    publishers = {p.label: (lambda run_id, ids, p=p: p.publish(run_id, ids)) for p in make_publishers(db)}
     if settings.whatsapp_enabled:
-        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publisher=publisher)
+        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publishers=publishers)
     log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
     return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant,
-                           publisher=publisher)
+                           publishers=publishers)
 
 
 def cmd_request_approval(db: Database, args) -> str:
@@ -151,14 +159,18 @@ def cmd_whatsapp(db: Database, args) -> str:
 
 
 def cmd_publish(db: Database, args) -> str:
-    """Post a run's approved templates that aren't on Instagram yet (approvals normally do this)."""
-    if not settings.instagram_enabled:
-        raise SystemExit("Set INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_USER_ID and JUSTNEWS_S3_BUCKET in .env first.")
+    """Post a run's approved templates that aren't on Instagram/X yet (approvals normally do this)."""
+    publishers = make_publishers(db)
+    if not publishers:
+        raise SystemExit("Set the Instagram (INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_USER_ID, JUSTNEWS_S3_BUCKET) "
+                         "or X (X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET) keys in .env first.")
     run_id = _resolve_run(db, args.run_id)
     approved = [p["article_id"] for p in db.posts_for_run(run_id) if p["approval"] == "approved" and p["image_path"]]
-    result = InstagramPublisher(settings, db).publish(run_id, approved)
-    print(json.dumps({"run_id": run_id, "posted": result.posted, "failed": result.failed,
-                      "skipped": result.skipped}, indent=2))
+    out = {"run_id": run_id}
+    for publisher in publishers:
+        result = publisher.publish(run_id, approved)
+        out[publisher.platform] = {"posted": result.posted, "failed": result.failed, "skipped": result.skipped}
+    print(json.dumps(out, indent=2))
     return run_id
 
 
@@ -176,18 +188,18 @@ def cmd_report(db: Database, args) -> str:
 
 def retry_failed_posts(db: Database) -> None:
     """Approved posts that failed last time are retried (or found to be live) before new news."""
-    if not settings.instagram_enabled:
-        return
-    try:
-        result = InstagramPublisher(settings, db).retry_failed()
-    except Exception:
-        log.exception("Retrying failed Instagram posts failed")
-        return
-    if result.posted and settings.whatsapp_enabled:
-        links = "\n".join(link for _, link in result.posted if link)
-        OutboxClient(db).send_text(settings.whatsapp_owner,
-                                   f"Update: {len(result.posted)} earlier post{'s are' if len(result.posted) != 1 else ' is'} "
-                                   f"now confirmed on Instagram ✅\n{links}")
+    for publisher in make_publishers(db):
+        try:
+            result = publisher.retry_failed()
+        except Exception:
+            log.exception("Retrying failed %s posts failed", publisher.label)
+            continue
+        if result.posted and settings.whatsapp_enabled:
+            links = "\n".join(link for _, link in result.posted if link)
+            n = len(result.posted)
+            OutboxClient(db).send_text(settings.whatsapp_owner,
+                                       f"Update: {n} earlier post{'s are' if n != 1 else ' is'} "
+                                       f"now confirmed on {publisher.label} ✅\n{links}")
 
 
 def run_cycle(db: Database, run_id: str | None = None) -> str:

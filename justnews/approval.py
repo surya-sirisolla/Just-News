@@ -31,6 +31,7 @@ log = logging.getLogger("justnews.approval")
 
 STALE_SECONDS = 300  # older messages are only acted on if a shortlist is open
 CONTEXT_HOURS = 48   # how long a finished shortlist stays available for "send me the templates"
+PLATFORM_LABELS = {"instagram": "Instagram", "x": "X"}
 SHOW_WORDS = {"list", "show list", "shortlist"}
 NONE_WORDS = {"none", "skip", "0", "nothing"}
 YES_WORDS = {"yes", "y", "yes please", "yeah", "yep", "ok", "okay", "confirm", "go ahead", "sure", "haan", "ha", "avunu"}
@@ -72,14 +73,15 @@ def _chunks(blocks: list[str], footer: str) -> list[str]:
 class ApprovalService:
     def __init__(self, settings: Settings, db: Database, client, designer: Callable[[str, list[str]], object],
                  owner: str | None = None, assistant=None,
-                 publisher: Callable[[str, list[str]], object] | None = None):
+                 publishers: dict[str, Callable[[str, list[str]], object]] | None = None):
         self.settings = settings
         self.db = db
         self.client = client
         self.designer = designer  # (run_id, approved article ids) -> image result
         self.owner = owner or settings.whatsapp_owner
         self.assistant = assistant  # free-text understanding; None -> keyword rules only
-        self.publisher = publisher  # (run_id, article ids) -> PublishResult; None -> posting not connected
+        # Platform label -> (run_id, article ids) -> PublishResult; empty -> posting not connected.
+        self.publishers = publishers or {}
 
     # --- outgoing ---------------------------------------------------------------
     def request(self, run_id: str) -> dict:
@@ -170,7 +172,7 @@ class ApprovalService:
         result = self.designer(req["run_id"], approved)
         made = getattr(result, "photos", 0) + getattr(result, "graphics", 0)
         failed = getattr(result, "failed", 0)
-        if self.publisher is None:
+        if not self.publishers:
             text = f"Done! ✅ I made the template{'s' if made != 1 else ''} for {numbers}."
             if failed:
                 text += f" {failed} didn't work out, so I've logged the error."
@@ -178,17 +180,27 @@ class ApprovalService:
                      "so they're saved as approved.")
             return self._reply(text, f"approved {', '.join(map(str, chosen))}")
 
-        published = self.publisher(req["run_id"], approved)
         number_of = {aid: n for n, aid in items.items()}
-        lines = [f"{number_of[aid]}. {link or '(posted)'}" for aid, link in published.posted]
-        if lines:
-            text = f"Done! ✅ Posted {len(lines)} to Instagram:\n" + "\n".join(lines)
-        else:
-            text = "I made the templates, but nothing could be posted to Instagram."
-        problems = published.failed + published.skipped
-        if problems:
-            text += "\n\nNot posted: " + "; ".join(f"{number_of.get(aid, '?')} ({why})" for aid, why in problems[:5])
-        return self._reply(text, f"approved {', '.join(map(str, chosen))}, posted {len(lines)}")
+        blocks, total = [], 0
+        for label, publish in self.publishers.items():
+            try:
+                published = publish(req["run_id"], approved)
+            except Exception as exc:  # one platform's crash must not hide the other's links
+                log.exception("Publishing to %s failed", label)
+                blocks.append(f"Not posted on {label}: {type(exc).__name__}, see the logs")
+                continue
+            lines = [f"{number_of[aid]}. {link or '(posted)'}" for aid, link in published.posted]
+            total += len(lines)
+            if lines:
+                blocks.append(f"Posted {len(lines)} to {label}:\n" + "\n".join(lines))
+            problems: dict[str, list[str]] = {}
+            for aid, why in published.failed + published.skipped:
+                problems.setdefault(why[:150], []).append(number_of.get(aid, "?"))
+            if problems:
+                blocks.append(f"Not posted on {label}: " + "; ".join(f"{_join(ns)} ({why})" for why, ns in problems.items()))
+        text = "\n\n".join(blocks)
+        text = f"Done! ✅ {text}" if total else f"I made the templates, but nothing could be posted.\n\n{text}".rstrip()
+        return self._reply(text, f"approved {', '.join(map(str, chosen))}, posted {total}")
 
     # --- free-form conversation -------------------------------------------------------
     def _recent_request(self, req):
@@ -204,7 +216,7 @@ class ApprovalService:
             return {}
         posts = {p["article_id"]: p for p in self.db.posts_for_run(req["run_id"])}
         return {int(n): {"headline": posts[aid]["headline"], "approval": posts[aid]["approval"] or "waiting",
-                         "posted": bool((pub := self.db.publication(aid, "instagram")) and pub["status"] == "published"),
+                         "posted": [PLATFORM_LABELS.get(x, x) for x in self.db.published_platforms(aid)],
                          "template": posts[aid]["image_path"], "caption": posts[aid]["caption"],
                          "hashtags": " ".join(json.loads(posts[aid]["hashtags"])),
                          "attribution": posts[aid]["attribution"]}
@@ -216,9 +228,9 @@ class ApprovalService:
         context = {
             "shortlist_open": open_req is not None,
             "waiting_for_yes_on": json.loads(open_req["pending"]) if open_req is not None and open_req["pending"] else None,
-            "instagram_posting_connected": self.publisher is not None,
+            "posting_connected_to": list(self.publishers),
             "stories": [{"number": n, "headline": s["headline"], "approval": s["approval"],
-                         "template_ready": bool(s["template"]), "posted_to_instagram": s["posted"]}
+                         "template_ready": bool(s["template"]), "posted_to": s["posted"]}
                         for n, s in stories.items()],
         }
         if not stories:

@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
 );
 CREATE TABLE IF NOT EXISTS publications (
     article_id    TEXT NOT NULL REFERENCES posts(article_id),
-    platform      TEXT NOT NULL,      -- "instagram" (later "x")
+    platform      TEXT NOT NULL,      -- "instagram" or "x"
     status        TEXT NOT NULL,      -- published / failed
     media_id      TEXT,
     permalink     TEXT,
@@ -390,11 +390,18 @@ class Database:
                       "updated_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                       (article_id, platform, status, media_id, permalink, error, _now(), attempts))
 
-    def failed_publications(self, platform: str, max_attempts: int) -> list[sqlite3.Row]:
+    def published_platforms(self, article_id: str) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT platform FROM publications WHERE article_id = ? AND status = 'published' ORDER BY platform",
+            (article_id,))]
+
+    def failed_publications(self, platform: str, max_attempts: int, within_hours: float) -> list[sqlite3.Row]:
+        since = (datetime.now(timezone.utc) - timedelta(hours=within_hours)).isoformat(timespec="seconds")
         return self.conn.execute(
             """SELECT pub.article_id, p.run_id FROM publications pub JOIN posts p ON p.article_id = pub.article_id
-               WHERE pub.platform = ? AND pub.status = 'failed' AND pub.attempts < ? AND p.approval = 'approved'""",
-            (platform, max_attempts)).fetchall()
+               WHERE pub.platform = ? AND pub.status = 'failed' AND pub.attempts < ? AND p.approval = 'approved'
+                 AND pub.updated_at >= ?""",
+            (platform, max_attempts, since)).fetchall()
 
     def published_since(self, platform: str, hours: float) -> int:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
