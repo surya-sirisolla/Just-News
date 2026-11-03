@@ -31,6 +31,12 @@ jobs:
     runs-on: ubuntu-latest
     concurrency: production
     steps:
+      - name: Show the identity GitHub presents to AWS (subject, audience; not the token)
+        run: |
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          claims=$(echo "$token" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null || true)
+          echo "::notice title=OIDC identity::sub=$(echo "$claims" | jq -r .sub) aud=$(echo "$claims" | jq -r .aud) iss=$(echo "$claims" | jq -r .iss)"
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
