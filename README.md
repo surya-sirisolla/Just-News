@@ -309,6 +309,18 @@ orchestrator call every hour (about $15/month). PicoClaw remains available for o
 - **One WhatsApp connection:** only one place may run the bridge at a time, so stop it on your Mac
   before starting the server.
 
+### Operating the server
+
+```bash
+ssh -i ~/.ssh/justnews-key.pem ubuntu@<server-ip> 'sudo journalctl -u justnews -f'      # live logs
+ssh -i ~/.ssh/justnews-key.pem ubuntu@<server-ip> 'sudo systemctl restart justnews'     # restart
+ssh -i ~/.ssh/justnews-key.pem ubuntu@<server-ip> 'sudo /opt/justnews/deploy/deploy.sh' # deploy by hand
+```
+
+Pushes to `main` deploy automatically. A failed test aborts the deploy, and the running version
+stays up. Restarts don't send an extra shortlist: the next cycle waits until an hour after the
+last one.
+
 ## Known limitations
 
 - Google News links are `news.google.com` redirect URLs, and those items have no summary.
