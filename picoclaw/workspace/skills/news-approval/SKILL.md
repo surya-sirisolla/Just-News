@@ -31,5 +31,6 @@ Stdout is JSON with `channel`, `requested` and `status`.
 
 - Never send images for confirmation, and never approve on the owner's behalf. Only run
   `reply` with the numbers the user actually gave.
-- Approved posts are queued. Instagram auto-posting is not connected yet, so never claim that
-  anything was posted.
+- When Instagram is configured, the owner's approval also posts to Instagram, and the bridge
+  confirms with links. Never run `./bin/justnews publish` yourself unless the user explicitly
+  asks, and never claim something was posted unless the output says so.

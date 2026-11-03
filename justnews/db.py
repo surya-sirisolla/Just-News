@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
     error         TEXT,              -- last failure; given up after the bridge's maximum attempts
     media_path    TEXT               -- image to send, with `body` as its caption
 );
+CREATE TABLE IF NOT EXISTS publications (
+    article_id    TEXT NOT NULL REFERENCES posts(article_id),
+    platform      TEXT NOT NULL,      -- "instagram" (later "x")
+    status        TEXT NOT NULL,      -- published / failed
+    media_id      TEXT,
+    permalink     TEXT,
+    error         TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (article_id, platform)
+);
 CREATE TABLE IF NOT EXISTS llm_usage (
     run_id        TEXT NOT NULL,
     agent         TEXT NOT NULL,
@@ -363,3 +373,19 @@ class Database:
     def mark_message_failed(self, message_id: int, error: str, max_attempts: int) -> None:
         with self.tx() as c:
             c.execute("UPDATE wa_outbox SET attempts = attempts + 1, error = ? WHERE id = ?", (error, message_id))
+
+    # --- publications (publisher) ------------------------------------------------
+    def publication(self, article_id: str, platform: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM publications WHERE article_id = ? AND platform = ?",
+                                 (article_id, platform)).fetchone()
+
+    def save_publication(self, article_id: str, platform: str, status: str, media_id: str | None = None,
+                         permalink: str | None = None, error: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO publications VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (article_id, platform, status, media_id, permalink, error, _now()))
+
+    def published_since(self, platform: str, hours: float) -> int:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+        return self.conn.execute("SELECT COUNT(*) FROM publications WHERE platform = ? AND status = 'published' "
+                                 "AND updated_at >= ?", (platform, since)).fetchone()[0]

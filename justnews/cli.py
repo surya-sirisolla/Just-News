@@ -9,6 +9,7 @@ PicoClaw skills call), or both together with `run`.
   python -m justnews whatsapp            # WhatsApp bridge: link a spare number (QR), then keep running
   python -m justnews request-approval [RUN_ID]  # queue the shortlist for the owner on WhatsApp
   python -m justnews reply "1 3"         # apply an approval reply from the command line
+  python -m justnews publish  [RUN_ID]   # Agent 5: post approved templates to Instagram
   python -m justnews run                 # agents 1-3, then the approval request (or agent 4 if
                                          # WhatsApp isn't configured), then the report
 """
@@ -26,6 +27,7 @@ from .agents.content import ContentCreatorAgent
 from .agents.discovery import NewsDiscoveryAgent
 from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
+from .agents.publisher import InstagramPublisher
 from .approval import ApprovalService
 from .assistant import Assistant
 from .whatsapp import Incoming, OutboxClient, WhatsAppBridge, WhatsAppError, bridge_running
@@ -101,10 +103,15 @@ def approval_service(db: Database) -> ApprovalService:
         assistant = Assistant([GeminiClient(settings.gemini_api_key, m, 0.0, 0.0, thinking_level="minimal",
                                             min_interval=settings.gemini_min_interval, temperature=0.6,
                                             timeout=20, retries=0) for m in settings.gemini_chat_models])
+    publisher = None
+    if settings.instagram_enabled:
+        def publisher(run_id: str, article_ids: list[str]):
+            return InstagramPublisher(settings, db).publish(run_id, article_ids)
     if settings.whatsapp_enabled:
-        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant)
+        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publisher=publisher)
     log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
-    return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant)
+    return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant,
+                           publisher=publisher)
 
 
 def cmd_request_approval(db: Database, args) -> str:
@@ -140,6 +147,18 @@ def cmd_whatsapp(db: Database, args) -> str:
     return ""
 
 
+def cmd_publish(db: Database, args) -> str:
+    """Post a run's approved templates that aren't on Instagram yet (approvals normally do this)."""
+    if not settings.instagram_enabled:
+        raise SystemExit("Set INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_USER_ID and JUSTNEWS_S3_BUCKET in .env first.")
+    run_id = _resolve_run(db, args.run_id)
+    approved = [p["article_id"] for p in db.posts_for_run(run_id) if p["approval"] == "approved" and p["image_path"]]
+    result = InstagramPublisher(settings, db).publish(run_id, approved)
+    print(json.dumps({"run_id": run_id, "posted": result.posted, "failed": result.failed,
+                      "skipped": result.skipped}, indent=2))
+    return run_id
+
+
 def cmd_report(db: Database, args) -> str:
     run_id = _resolve_run(db, args.run_id)
     report = build_report(db, run_id)
@@ -173,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="justnews", description="Just News agents")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn in [("discover", cmd_discover), ("evaluate", cmd_evaluate), ("create", cmd_create),
-                     ("design", cmd_design), ("request-approval", cmd_request_approval),
+                     ("design", cmd_design), ("request-approval", cmd_request_approval), ("publish", cmd_publish),
                      ("report", cmd_report), ("run", cmd_run)]:
         p = sub.add_parser(name)
         p.add_argument("run_id", nargs="?", default=None)

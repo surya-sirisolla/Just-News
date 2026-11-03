@@ -189,7 +189,8 @@ justnews/
   agents/images.py      Agent 4 (Wikimedia Commons search, licence filter)
   graphics.py           Pillow layouts: white text graphic, photo with overlay
   jev.py                TypeSafe Jev: scoring, duplicate checks, post review, photo choice
-  approval.py           WhatsApp approval: shortlist, reply parsing, design on approval
+  agents/publisher.py   Agent 5: Instagram publishing (S3 presigned link, container, publish)
+  approval.py           WhatsApp approval: shortlist, reply parsing, design + post on approval
   assistant.py          natural-language replies on WhatsApp (Gemini free tier, keyword fallback)
   whatsapp.py           linked-device WhatsApp bridge (QR link, outbox sender, owner filter)
   llm.py                Claude (Anthropic SDK) and Gemini clients, token/cost accounting
@@ -235,30 +236,29 @@ Only posts you approved on WhatsApp will be published. Both platforms need their
 (neither offers a QR-style link for posting). Once the keys below are in `.env`, the publisher
 agent is the next piece to build.
 
-### Instagram (Instagram Graph API)
+### Instagram (built: Agent 5, `justnews/agents/publisher.py`)
 
-1. **Professional account:** in the Instagram app for Just News, go to Settings > Account type and
-   tools > Switch to professional account, and choose Business or Creator.
-2. **Facebook Page:** link the account to a Facebook Page (Accounts Center, or the Page's settings
-   > Linked accounts). Meta's publishing guide expects this.
-3. **Meta app:** at developers.facebook.com > My Apps > Create app, pick the Instagram use case
-   (manage messaging and content) and a Business app type.
-4. **Connect the account:** in the app's Instagram > API setup with Instagram login, add your
-   Instagram account. If asked, add it under App roles > Instagram testers, and accept the invite
-   in Instagram (Settings > Website permissions > Apps and websites > Tester invites). The app can
-   stay in Development mode, because posting to your own account needs no App Review.
-5. **Permissions and token:** grant `instagram_business_basic` and
-   `instagram_business_content_publish`, then generate a long-lived token. It lasts about 60
-   days, and the publisher will refresh it.
-6. **`.env`:** set `INSTAGRAM_ACCESS_TOKEN` and `INSTAGRAM_USER_ID` (the IG user ID shown in API
-   setup).
-7. **Public image hosting:** Meta downloads each image from a public HTTPS URL. Create a public
-   bucket, for example on Cloudflare R2 (its free tier is plenty) or S3, and set
-   `MEDIA_PUBLIC_BASE_URL` and the bucket keys in `.env`.
-8. **What the publisher will do:** convert the PNG to JPEG (Instagram accepts only JPEG), upload
-   it, create the post with `POST /<IG_ID>/media` (`image_url`, caption and hashtags), then
-   publish it with `POST /<IG_ID>/media_publish`. Limits: 100 API posts per 24 hours, captions up
-   to 2,200 characters, at most 30 hashtags.
+Approving a story on WhatsApp now designs its template **and posts it**. The bot replies with the
+post links, and `python -m justnews publish [RUN_ID]` posts approved templates by hand.
+
+1. **Token:** in Meta **Business Settings → Users → System users**, create a system user (Admin).
+   Use **Assign assets** to give it the **Just News app** (Full control) and the **Instagram
+   account** (Full control). Then click **Generate token**: app Just News, expiry **Never**,
+   permissions `instagram_basic` and `instagram_content_publish`. The "Generate token" button in
+   the app's Unified-login page creates a hidden system user that can't be given the account, so
+   use this one.
+2. **`.env`:** set `INSTAGRAM_ACCESS_TOKEN` and `INSTAGRAM_USER_ID` (the numeric ID shown in
+   Business Settings → Instagram accounts).
+3. **S3 bucket:** create a private bucket with "Block all public access" left on. Add a lifecycle
+   rule that expires `posts/` after 7 days, and an IAM user (or, on AWS, a role) allowed
+   `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on `arn:aws:s3:::BUCKET/posts/*`.
+   Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `JUSTNEWS_S3_BUCKET`.
+4. **How each post goes out:** the PNG becomes a JPEG, is uploaded to S3 and gets a 1-hour
+   presigned link. Then `POST /<IG_ID>/media` creates the post, the publisher waits for
+   `FINISHED`, and `POST /<IG_ID>/media_publish` publishes it. The permalink is saved and the S3
+   copy deleted.
+5. **Safeguards:** each story is posted once, at most `JUSTNEWS_MAX_POSTS_PER_DAY` (10) per day
+   (Instagram allows 100). The caption includes the photo credit for licensed photos.
 
 ### X / Twitter (X API v2)
 

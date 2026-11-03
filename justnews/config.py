@@ -116,6 +116,20 @@ class Settings:
     gemini_chat_models: list[str] = field(default_factory=lambda: _list(
         "GEMINI_CHAT_MODELS", ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"]))
 
+    # Instagram publishing (Instagram Graph API via a Meta system-user token) and S3 for the
+    # images Instagram downloads. Publishing is on when the token, account ID and bucket are set.
+    instagram_token: str = field(default_factory=lambda: os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip())
+    instagram_user_id: str = field(default_factory=lambda: os.getenv("INSTAGRAM_USER_ID", "").strip())
+    instagram_api_version: str = field(default_factory=lambda: os.getenv("INSTAGRAM_API_VERSION", "v23.0"))
+    s3_bucket: str = field(default_factory=lambda: os.getenv("JUSTNEWS_S3_BUCKET", "").strip())
+    aws_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "ap-south-1"))
+    # Our own cap, well under Instagram's 100 API posts per 24 hours.
+    max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 10))
+
+    @property
+    def instagram_enabled(self) -> bool:
+        return bool(self.instagram_token and self.instagram_user_id and self.s3_bucket)
+
     @property
     def whatsapp_enabled(self) -> bool:
         return bool(self.whatsapp_owner)

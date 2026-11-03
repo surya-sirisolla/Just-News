@@ -70,13 +70,15 @@ def _chunks(blocks: list[str], footer: str) -> list[str]:
 
 class ApprovalService:
     def __init__(self, settings: Settings, db: Database, client, designer: Callable[[str, list[str]], object],
-                 owner: str | None = None, assistant=None):
+                 owner: str | None = None, assistant=None,
+                 publisher: Callable[[str, list[str]], object] | None = None):
         self.settings = settings
         self.db = db
         self.client = client
         self.designer = designer  # (run_id, approved article ids) -> image result
         self.owner = owner or settings.whatsapp_owner
         self.assistant = assistant  # free-text understanding; None -> keyword rules only
+        self.publisher = publisher  # (run_id, article ids) -> PublishResult; None -> posting not connected
 
     # --- outgoing ---------------------------------------------------------------
     def request(self, run_id: str) -> dict:
@@ -165,12 +167,25 @@ class ApprovalService:
         result = self.designer(req["run_id"], approved)
         made = getattr(result, "photos", 0) + getattr(result, "graphics", 0)
         failed = getattr(result, "failed", 0)
-        text = f"Done! ✅ I made the template{'s' if made != 1 else ''} for {numbers}."
-        if failed:
-            text += f" {failed} didn't work out, so I've logged the error."
-        text += (" Say *send me the templates* if you'd like to see them here. Posting isn't connected yet, "
-                 "so they're saved as approved.")
-        return self._reply(text, f"approved {', '.join(map(str, chosen))}")
+        if self.publisher is None:
+            text = f"Done! ✅ I made the template{'s' if made != 1 else ''} for {numbers}."
+            if failed:
+                text += f" {failed} didn't work out, so I've logged the error."
+            text += (" Say *send me the templates* if you'd like to see them here. Posting isn't connected yet, "
+                     "so they're saved as approved.")
+            return self._reply(text, f"approved {', '.join(map(str, chosen))}")
+
+        published = self.publisher(req["run_id"], approved)
+        number_of = {aid: n for n, aid in items.items()}
+        lines = [f"{number_of[aid]}. {link or '(posted)'}" for aid, link in published.posted]
+        if lines:
+            text = f"Done! ✅ Posted {len(lines)} to Instagram:\n" + "\n".join(lines)
+        else:
+            text = "I made the templates, but nothing could be posted to Instagram."
+        problems = published.failed + published.skipped
+        if problems:
+            text += "\n\nNot posted: " + "; ".join(f"{number_of.get(aid, '?')} ({why})" for aid, why in problems[:5])
+        return self._reply(text, f"approved {', '.join(map(str, chosen))}, posted {len(lines)}")
 
     # --- free-form conversation -------------------------------------------------------
     def _recent_request(self, req):
@@ -186,6 +201,7 @@ class ApprovalService:
             return {}
         posts = {p["article_id"]: p for p in self.db.posts_for_run(req["run_id"])}
         return {int(n): {"headline": posts[aid]["headline"], "approval": posts[aid]["approval"] or "waiting",
+                         "posted": bool((pub := self.db.publication(aid, "instagram")) and pub["status"] == "published"),
                          "template": posts[aid]["image_path"], "caption": posts[aid]["caption"],
                          "hashtags": " ".join(json.loads(posts[aid]["hashtags"])),
                          "attribution": posts[aid]["attribution"]}
@@ -197,8 +213,10 @@ class ApprovalService:
         context = {
             "shortlist_open": open_req is not None,
             "waiting_for_yes_on": json.loads(open_req["pending"]) if open_req is not None and open_req["pending"] else None,
+            "instagram_posting_connected": self.publisher is not None,
             "stories": [{"number": n, "headline": s["headline"], "approval": s["approval"],
-                         "template_ready": bool(s["template"])} for n, s in stories.items()],
+                         "template_ready": bool(s["template"]), "posted_to_instagram": s["posted"]}
+                        for n, s in stories.items()],
         }
         if not stories:
             context["note"] = "No shortlist in the last 48 hours; the next one comes with the next news cycle."
