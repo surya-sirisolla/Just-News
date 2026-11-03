@@ -309,6 +309,16 @@ orchestrator call every hour (about $15/month). PicoClaw remains available for o
 - **One WhatsApp connection:** only one place may run the bridge at a time, so stop it on your Mac
   before starting the server.
 
+### AWS setup notes
+
+- **Server role:** the instance role needs **AmazonSSMManagedInstanceCore** (so GitHub can deploy
+  through Systems Manager) plus the S3 policy for `posts/*`. After adding it, run
+  `sudo snap restart amazon-ssm-agent` to register at once; otherwise the agent retries every
+  ~30 minutes.
+- **GitHub sign-in:** GitHub sends an OIDC subject that includes the owner's and repo's numeric
+  IDs, e.g. `repo:surya-sirisolla@267958361/Just-News@1443222459:ref:refs/heads/main`. The deploy
+  role's trust policy must match that exact subject; the name-only form is rejected.
+
 ### Operating the server
 
 ```bash
