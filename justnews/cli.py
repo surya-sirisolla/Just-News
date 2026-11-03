@@ -31,6 +31,7 @@ from .agents.discovery import NewsDiscoveryAgent
 from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
 from .agents.publisher import InstagramPublisher, Publisher
+from .agents.strategist import StrategistAgent
 from .agents.x_publisher import XPublisher
 from .approval import ApprovalService
 from .assistant import Assistant
@@ -70,9 +71,31 @@ def cmd_evaluate(db: Database, args) -> str:
     return run_id
 
 
+def make_strategist(db: Database) -> StrategistAgent | None:
+    return StrategistAgent(settings, db, make_publishers(db)) if settings.strategist else None
+
+
+def write_posts(db: Database, run_id: str):
+    """Agent 6 (strategist) prepares the playbook, then Agent 3 writes and discusses the drafts."""
+    strategist = make_strategist(db)
+    if strategist:
+        strategist.prepare(run_id)
+    return ContentCreatorAgent(settings, db, strategist=strategist).run(run_id)
+
+
+def cmd_strategy(db: Database, args) -> str:
+    """Read engagement and benchmarks, refresh the playbook, and print it."""
+    run_id = _resolve_run(db, args.run_id)
+    stats = StrategistAgent(settings, db, make_publishers(db)).prepare(run_id)
+    row = db.latest_playbook()
+    print(json.dumps({"run_id": run_id, **stats, "playbook": json.loads(row["playbook"]) if row else None,
+                      "playbook_from": row["model"] if row else None}, indent=2, ensure_ascii=False))
+    return run_id
+
+
 def cmd_create(db: Database, args) -> str:
     run_id = _resolve_run(db, args.run_id)
-    result = ContentCreatorAgent(settings, db).run(run_id)
+    result = write_posts(db, run_id)
     print(json.dumps({"run_id": run_id, **result.stats()}, indent=2))
     if result.error and not result.created and result.pending:
         raise LLMError(result.error)
@@ -203,13 +226,14 @@ def retry_failed_posts(db: Database) -> None:
 
 
 def run_cycle(db: Database, run_id: str | None = None) -> str:
-    """Agents 1-3, then the WhatsApp shortlist (or Agent 4 for every draft without WhatsApp)."""
+    """Agents 1-2, the strategist (6) and content creator (3), then the WhatsApp shortlist (or Agent 4
+    for every draft without WhatsApp)."""
     run_id = run_id or new_run_id()
     retry_failed_posts(db)
     NewsDiscoveryAgent(settings, db).run(run_id)
     NewsEvaluatorAgent(settings, db).run(run_id)
     try:
-        ContentCreatorAgent(settings, db).run(run_id)
+        write_posts(db, run_id)
     except LLMError as exc:  # e.g. no Gemini key: keep the evaluation results and report them
         log.error("Skipping post creation: %s", exc)
     if settings.whatsapp_enabled:
@@ -272,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn in [("discover", cmd_discover), ("evaluate", cmd_evaluate), ("create", cmd_create),
                      ("design", cmd_design), ("request-approval", cmd_request_approval), ("publish", cmd_publish),
-                     ("report", cmd_report), ("run", cmd_run)]:
+                     ("report", cmd_report), ("run", cmd_run), ("strategy", cmd_strategy)]:
         p = sub.add_parser(name)
         p.add_argument("run_id", nargs="?", default=None)
         p.add_argument("--format", choices=["md", "json"], default="md")

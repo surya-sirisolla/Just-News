@@ -36,6 +36,9 @@ class FakeGemini:
             self.usage.failed_calls += 1
             raise self.error
         self.usage.calls += 1
+        if "DRAFTS AND NOTES:" in prompt:  # a revision round: this model changes nothing
+            items = json.loads(prompt.split("DRAFTS AND NOTES:\n", 1)[1])
+            return {"posts": [{"id": it["id"], **it["draft"], "reply": "Kept it."} for it in items]}
         items = json.loads(prompt.split("ARTICLES:\n", 1)[1])
         return {"posts": [{"id": it["id"], **self.posts.get(it["headline"], {})} for it in items]}
 

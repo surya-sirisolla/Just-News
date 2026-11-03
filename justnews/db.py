@@ -114,6 +114,55 @@ CREATE TABLE IF NOT EXISTS publications (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (article_id, platform)
 );
+CREATE TABLE IF NOT EXISTS post_metrics (
+    article_id    TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    checks        INTEGER NOT NULL,   -- how many of the strategist's checkpoints have been read
+    likes         INTEGER,
+    comments      INTEGER,
+    shares        INTEGER,            -- Instagram shares / X reposts + quotes
+    saves         INTEGER,            -- Instagram saves / X bookmarks
+    views         INTEGER,            -- Instagram views (needs insights) / X impressions
+    reach         INTEGER,
+    fetched_at    TEXT NOT NULL,
+    PRIMARY KEY (article_id, platform)
+);
+CREATE TABLE IF NOT EXISTS benchmarks (  -- recent posts of other news accounts
+    platform      TEXT NOT NULL,
+    post_id       TEXT NOT NULL,
+    account       TEXT NOT NULL,
+    followers     INTEGER,
+    text          TEXT,
+    media_type    TEXT,
+    likes         INTEGER,
+    comments      INTEGER,
+    shares        INTEGER,
+    views         INTEGER,
+    posted_at     TEXT,
+    fetched_at    TEXT NOT NULL,
+    PRIMARY KEY (platform, post_id)
+);
+CREATE TABLE IF NOT EXISTS playbooks (   -- the strategist's current rules for each platform
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    playbook      TEXT NOT NULL,      -- JSON
+    evidence      TEXT,               -- JSON: what it was based on
+    model         TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_messages (  -- the strategist <-> content creator discussion
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL,
+    article_id    TEXT,
+    sender        TEXT NOT NULL,
+    recipient     TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_state (     -- small key/value notes, e.g. when a read was last tried
+    key           TEXT PRIMARY KEY,
+    value         TEXT,
+    updated_at    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS llm_usage (
     run_id        TEXT NOT NULL,
     agent         TEXT NOT NULL,
@@ -143,12 +192,16 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(runs)")}
-        for column in ("content", "images"):  # added with agents 3 and 4
+        for column in ("content", "images", "strategy"):  # added with agents 3, 4 and 6
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
         if "approval" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}:
             # NULL (not asked) / requested / approved / rejected
             self.conn.execute("ALTER TABLE posts ADD COLUMN approval TEXT")
+        post_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}
+        for column in ("ig_caption", "x_post"):  # platform versions, added with the strategist
+            if column not in post_columns:
+                self.conn.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
         if "media_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}:
             self.conn.execute("ALTER TABLE wa_outbox ADD COLUMN media_path TEXT")
         if "attempts" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(publications)")}:
@@ -169,7 +222,7 @@ class Database:
             c.execute("INSERT OR IGNORE INTO runs(run_id, started_at) VALUES (?, ?)", (run_id, _now()))
 
     def save_run_stats(self, run_id: str, stage: str, stats: dict) -> None:
-        assert stage in ("discovery", "evaluation", "content", "images")
+        assert stage in ("discovery", "evaluation", "content", "images", "strategy")
         with self.tx() as c:
             c.execute(f"UPDATE runs SET {stage} = ? WHERE run_id = ?", (json.dumps(stats), run_id))
 
@@ -184,6 +237,7 @@ class Database:
             "evaluation": json.loads(row["evaluation"]) if row["evaluation"] else None,
             "content": json.loads(row["content"]) if row["content"] else None,
             "images": json.loads(row["images"]) if row["images"] else None,
+            "strategy": json.loads(row["strategy"]) if row["strategy"] else None,
         }
 
     def latest_run_id(self) -> str | None:
@@ -278,11 +332,11 @@ class Database:
         with self.tx() as c:
             c.execute(
                 """INSERT OR REPLACE INTO posts(article_id, run_id, headline, caption, hashtags, attribution,
-                       image_text, visual, image_query, status, review_note, model, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       image_text, visual, image_query, status, review_note, model, created_at, ig_caption, x_post)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (article_id, run_id, post["headline"], post["caption"], json.dumps(post["hashtags"]),
                  post["attribution"], post["image_text"], post["visual"], post.get("image_query"),
-                 post["status"], post.get("review_note"), model, _now()))
+                 post["status"], post.get("review_note"), model, _now(), post.get("ig_caption"), post.get("x_post")))
 
     def posts_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -407,3 +461,70 @@ class Database:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
         return self.conn.execute("SELECT COUNT(*) FROM publications WHERE platform = ? AND status = 'published' "
                                  "AND updated_at >= ?", (platform, since)).fetchone()[0]
+
+    # --- strategist: engagement, benchmarks, playbook, discussion --------------------
+    def published_posts(self, platform: str, days: float) -> list[sqlite3.Row]:
+        """Our live posts with their latest metrics, newest first."""
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+        return self.conn.execute(
+            """SELECT pub.article_id, pub.media_id, pub.updated_at AS published_at, p.headline, p.caption,
+                      p.ig_caption, p.x_post, p.hashtags, a.category, i.kind AS image_kind,
+                      m.checks, m.likes, m.comments, m.shares, m.saves, m.views, m.reach, m.fetched_at
+               FROM publications pub JOIN posts p ON p.article_id = pub.article_id
+               JOIN articles a ON a.id = pub.article_id
+               LEFT JOIN images i ON i.article_id = pub.article_id
+               LEFT JOIN post_metrics m ON m.article_id = pub.article_id AND m.platform = pub.platform
+               WHERE pub.platform = ? AND pub.status = 'published' AND pub.media_id <> '' AND pub.updated_at >= ?
+               ORDER BY pub.updated_at DESC""", (platform, since)).fetchall()
+
+    def save_metrics(self, article_id: str, platform: str, checks: int, metrics: dict) -> None:
+        with self.tx() as c:
+            c.execute("""INSERT OR REPLACE INTO post_metrics(article_id, platform, checks, likes, comments, shares,
+                             saves, views, reach, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (article_id, platform, checks, metrics.get("likes"), metrics.get("comments"),
+                       metrics.get("shares"), metrics.get("saves"), metrics.get("views"), metrics.get("reach"), _now()))
+
+    def save_benchmarks(self, platform: str, posts: list[dict]) -> None:
+        now = _now()
+        with self.tx() as c:
+            for b in posts:
+                c.execute("""INSERT OR REPLACE INTO benchmarks(platform, post_id, account, followers, text, media_type,
+                                 likes, comments, shares, views, posted_at, fetched_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (platform, b["post_id"], b["account"], b.get("followers"), b.get("text"), b.get("media_type"),
+                           b.get("likes"), b.get("comments"), b.get("shares"), b.get("views"), b.get("posted_at"), now))
+
+    def benchmarks(self, platform: str, days: float) -> list[sqlite3.Row]:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+        return self.conn.execute("SELECT * FROM benchmarks WHERE platform = ? AND fetched_at >= ? ORDER BY fetched_at DESC",
+                                 (platform, since)).fetchall()
+
+    def last_benchmark_at(self, platform: str) -> str | None:
+        return self.conn.execute("SELECT MAX(fetched_at) FROM benchmarks WHERE platform = ?", (platform,)).fetchone()[0]
+
+    def last_metrics_at(self) -> str | None:
+        return self.conn.execute("SELECT MAX(fetched_at) FROM post_metrics").fetchone()[0]
+
+    def save_playbook(self, playbook: dict, evidence: dict, model: str) -> int:
+        with self.tx() as c:
+            return c.execute("INSERT INTO playbooks(created_at, playbook, evidence, model) VALUES (?, ?, ?, ?)",
+                             (_now(), json.dumps(playbook, ensure_ascii=False), json.dumps(evidence), model)).lastrowid
+
+    def latest_playbook(self) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM playbooks ORDER BY id DESC LIMIT 1").fetchone()
+
+    def add_agent_message(self, run_id: str, sender: str, recipient: str, body: str, article_id: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO agent_messages(run_id, article_id, sender, recipient, body, created_at) "
+                      "VALUES (?, ?, ?, ?, ?, ?)", (run_id, article_id, sender, recipient, body, _now()))
+
+    def get_state(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM agent_state WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO agent_state(key, value, updated_at) VALUES (?, ?, ?)", (key, value, _now()))
+
+    def agent_messages(self, run_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM agent_messages WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()

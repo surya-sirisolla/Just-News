@@ -1,9 +1,8 @@
 # Just News – Agentic News Discovery
 
-An agentic social media automation platform. Four independent agents, orchestrated by
-[PicoClaw](https://github.com/sipeed/picoclaw), find recent news, decide what is worth posting, and
-draft posts. The owner picks on WhatsApp which posts to make, and only those get an image.
-Instagram publishing is the next phase (see [Instagram auto-posting](#instagram-auto-posting-what-is-needed)).
+An agentic social media automation platform. Six independent agents find recent news, decide what
+is worth posting, learn what earns attention, and write a separate version for Instagram and for X.
+The owner picks on WhatsApp which stories to post; only those get an image and are published.
 
 | Agent | Module | PicoClaw skill | LLM |
 |---|---|---|---|
@@ -11,6 +10,8 @@ Instagram publishing is the next phase (see [Instagram auto-posting](#instagram-
 | 2. News Evaluator | `justnews/agents/evaluator.py` | `news-evaluator` | TypeSafe Jev (Claude Haiku 5.5 or Gemini as alternatives) |
 | 3. Content Creator | `justnews/agents/content.py` | `news-content-creator` | Gemini free tier writes; Jev reviews |
 | 4. Image Designer | `justnews/agents/images.py` | `news-image-designer` | none to draw; Jev picks photos |
+| 5. Publisher | `justnews/agents/publisher.py`, `x_publisher.py` | (only after WhatsApp approval) | none |
+| 6. Engagement Strategist | `justnews/agents/strategist.py` | (runs inside `create`) | Gemini free tier (lite models first) |
 
 ## How it works
 
@@ -265,6 +266,8 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
 
 1. **Developer account:** sign in to console.x.com as the Just News X account, accept the
    developer agreement, and create an app.
+   The app must sit inside a **Project** (console.x.com → Projects). A standalone app answers 403
+   `client-not-enrolled` even with credits.
 2. **App permissions:** in User authentication settings, set the app permissions to **Read and
    write**, with the type "Web App, Automated App or Bot". The callback and website URLs aren't
    used (the publisher never signs anyone in), but the form needs them: the GitHub repo URL works.
@@ -292,6 +295,62 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
 8. **Safeguards:** the same as Instagram: each story is posted once, at most
    `JUSTNEWS_MAX_POSTS_PER_DAY` per day, and a timed-out post is looked up on the account before
    any retry. X also refuses identical text, which the publisher treats as "already posted".
+
+## Engagement strategist and the agents' discussion
+
+**Off by default for now** (`JUSTNEWS_STRATEGIST=true` turns it on). While it's off, nothing is
+read from either platform, and the content creator still writes separate Instagram and X versions
+from the latest saved playbook (the research defaults below); Jev's fact-check round still runs.
+
+When on, Agent 6 runs before posts are written (`python -m justnews create`, and every hourly cycle).
+- **Our engagement:** reads each live post's numbers at fixed ages: Instagram at 3, 24 and 72
+  hours (free), X at 6 and 48 hours (X charges $0.005 per post read, so about $3 a month at 10 posts
+  a day). Stored in `post_metrics`.
+- **Other news accounts:** every 3 days (`JUSTNEWS_BENCHMARK_EVERY_HOURS`), reads the last 10 posts
+  of `JUSTNEWS_BENCHMARK_INSTAGRAM` (bbcnews, reuters, ndtv, cnn) and `JUSTNEWS_BENCHMARK_X`
+  (BBCWorld, Reuters, ndtv), about $1.50 a month on X. Stored in `benchmarks`.
+- **Playbook:** when there's new evidence (at most every 6 hours, at least daily), Gemini updates the
+  rules for each platform, plus "what other accounts do that we don't" and experiments. It starts
+  from research-based defaults (`BASE_PLAYBOOK`) and is told how small our sample is. Observations
+  about other accounts are kept only when benchmark posts were actually read. Stored in `playbooks`.
+
+Then, for each run's drafts:
+```
+content creator ──drafts (Instagram + X versions)──▶ strategist
+strategist ──notes: code checks (hook length, publisher name, X repeats the hook…) + Gemini critique──▶
+content creator ──revises once, or pushes back when a note would need facts the source lacks──▶
+fact checker (Jev) ──flags facts not in the source──▶ content creator revises once ──▶ Jev checks again
+```
+Still-flagged posts are marked ⚠️ in the WhatsApp shortlist. Every message is saved in
+`agent_messages` and listed under "Discussion between the agents" in the run report.
+`python -m justnews strategy` refreshes the numbers and prints the playbook.
+
+**How the two versions differ** (the starting playbook):
+
+| | Instagram | X |
+|---|---|---|
+| Reader | reads | scans |
+| Shape | hook line (≤120 chars, the feed cuts there), 1-2 short paragraphs of the source's facts | one wire-style line leading with the news |
+| Extras | a question about the reader's own experience (not on tragedies, crime, court cases or political disputes) | country flag; "JUST IN:" only for stories under an hour old |
+| Hashtags | 3-5 (Instagram's limit is 5) | 1-2 |
+| Links | source link (tracking parameters removed; Google News redirects dropped) | none (a link makes a post cost $0.20 instead of $0.015) |
+
+**Research behind the defaults** (2026; mostly vendor studies, so directional):
+- **Instagram ranking:** shares (sends), saves and comments outweigh likes. Carousels lead on saves
+  and engagement rate, Reels on reach for small accounts
+  ([Later](https://later.com/blog/how-instagram-algorithm-works/),
+  [Socialinsider benchmarks](https://www.socialinsider.io/social-media-benchmarks/instagram),
+  [Metricool 2026 study](https://metricool.com/press-release-instagram-study-2026/)).
+- **X ranking:** X's open-sourced feed code (Jan 2026) predicts about 15 actions, with replies and
+  reposts strong and mutes or blocks strongly negative; hashtags matter little, and posts with
+  images do better than text-only
+  ([summary of the code](https://postory.io/blog/x-algorithm-2026),
+  [OpenTweet](https://opentweet.io/blog/how-twitter-x-algorithm-works-2026)).
+- **Pricing:** [X API pricing](https://docs.x.com/x-api/getting-started/pricing).
+
+**Free-tier note:** a cycle now makes up to 4 Gemini requests (write, review, revise, fact-check
+revision) instead of 1. The strategist uses the lite models first, so the better models' daily
+quota goes to writing.
 
 ## Running every hour
 

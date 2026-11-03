@@ -136,6 +136,17 @@ class Settings:
     x_access_token: str = field(default_factory=lambda: os.getenv("X_ACCESS_TOKEN", "").strip())
     x_access_token_secret: str = field(default_factory=lambda: os.getenv("X_ACCESS_TOKEN_SECRET", "").strip())
 
+    # Engagement strategist (agents/strategist.py): learns from our posts' engagement and from
+    # other news accounts, and reviews drafts with the content creator. Off by default for now;
+    # without it, posts follow the latest saved playbook (or the research defaults).
+    strategist: bool = field(default_factory=lambda: os.getenv("JUSTNEWS_STRATEGIST", "false").lower() == "true")
+    benchmark_instagram: list[str] = field(default_factory=lambda: _list(
+        "JUSTNEWS_BENCHMARK_INSTAGRAM", ["bbcnews", "reuters", "ndtv", "cnn"]))
+    # X charges per post read ($0.005): 3 accounts x 10 posts every 3 days is about $1.50 a month.
+    benchmark_x: list[str] = field(default_factory=lambda: _list("JUSTNEWS_BENCHMARK_X", ["BBCWorld", "Reuters", "ndtv"]))
+    benchmark_posts: int = field(default_factory=lambda: _int("JUSTNEWS_BENCHMARK_POSTS", 10))
+    benchmark_every_hours: float = field(default_factory=lambda: _float("JUSTNEWS_BENCHMARK_EVERY_HOURS", 72))
+
     @property
     def instagram_enabled(self) -> bool:
         return bool(self.instagram_token and self.instagram_user_id and self.s3_bucket)

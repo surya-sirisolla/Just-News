@@ -158,8 +158,12 @@ class ConversationTests(Base):
         self.assertEqual(self.say("send me the templates"), "sent templates [1, 3]")
         images = self.sent_images()
         self.assertEqual([Path(p).name for p, _ in images], ["t1.png", "t3.png"])
-        self.assertIn("*1. Headline 1*", images[0][1])
+        self.assertTrue(images[0][1].startswith("*1.* 📸 Instagram\nHeadline 1"))  # the exact Instagram text
         self.assertIn("Sure, here they are!", self.outbox())
+        x_versions = [m for m in self.outbox() if "𝕏 X" in m]
+        self.assertEqual(len(x_versions), 2)
+        self.assertIn("Source: BBC News", x_versions[0])
+        self.assertNotIn("http", x_versions[0])  # the X version carries no link
 
     def test_asking_for_a_missing_template_says_so(self):
         self.service.request("r1")

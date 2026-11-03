@@ -73,8 +73,8 @@ class TextTests(unittest.TestCase):
         self.assertNotIn("http", text)
         self.assertNotIn(".com", text)
         self.assertNotIn("www.", text)
-        self.assertIn("#Apple #India #Retail", text)
-        self.assertNotIn("#Tech", text)  # three hashtags at most
+        self.assertIn("#Apple #India", text)
+        self.assertNotIn("#Retail", text)  # two hashtags at most
 
     def test_long_text_drops_caption_then_hashtags_but_keeps_credit(self):
         credit = "File photo: Jane Doe / Wikimedia Commons, CC BY-SA 4.0"

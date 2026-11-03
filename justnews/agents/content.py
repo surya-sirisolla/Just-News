@@ -1,8 +1,13 @@
 """Agent 3 - Content Creator.
 
 Turns the evaluator's recommended articles into draft social posts: a short headline, a caption,
-hashtags, a source attribution, the text for the image, and a suggestion for the image designer
-(licensed photo or text graphic, plus a photo search query).
+hashtags, a source attribution, the text for the image, a suggestion for the image designer
+(licensed photo or text graphic, plus a photo search query), and a separate version for each
+platform: an explainer-style Instagram caption and a short wire-style X post.
+
+When the engagement strategist (strategist.py) is on, the writing follows its playbook, and the
+strategist reviews the drafts: the drafts that get notes are revised once, and the content creator
+may push back when a note would need facts the source doesn't give.
 
 Gemini (free tier) writes the text. Free-tier quotas are small, so all posts in a run go out in a
 single request, requests are spaced out, and when a model's daily quota is used up the next model
@@ -20,6 +25,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from datetime import datetime, timezone
+
 from ..config import Settings
 from ..db import Database
 from ..llm import GeminiClient, LLMError
@@ -29,6 +36,9 @@ log = logging.getLogger("justnews.content")
 HEADLINE_MAX = 80
 CAPTION_MAX = 280      # fits X/Twitter; the attribution and hashtags are added separately
 IMAGE_TEXT_MAX = 60
+IG_CAPTION_MAX = 900   # Instagram allows 2200; hashtags, source and credit are added after
+X_POST_MAX = 230       # X allows 280; hashtags, source and credit are added after
+FRESH_HOURS = 1        # "JUST IN:" only for stories this new
 HASHTAGS = (3, 5)
 REVIEW_THRESHOLD = 0.5
 
@@ -52,7 +62,26 @@ For each article you get only its headline, summary, publisher and section. Writ
   disasters, health tragedies, stories about private individuals, or when no generic photo fits.
 - image_query: for "photo", 2-4 words naming what the photo should show (e.g. "supermarket
   freezer", "Microsoft headquarters"); never a person who is a victim or suspect. Empty for "graphic".
+- ig_caption: the Instagram version, 120-700 characters, for people who read. Line 1 is the hook,
+  at most 120 characters: the key fact stated plainly. Then 1-2 short paragraphs separated by a
+  blank line ("\n\n") with the details the source gives. No interpretation or context the source
+  does not state; when the summary is short, so is the caption. Follow the PLAYBOOK's Instagram rules.
+- x_post: the X version, at most 200 characters, for people who scan: one or two lines that lead
+  with the news itself. It must read differently from the ig_caption hook. Follow the PLAYBOOK's
+  X rules. Start with "JUST IN:" only when the article has "fresh": true.
+Both versions use ONLY facts from the headline or summary, keep the neutral tone, and contain no
+hashtags and no links (they are added separately). The PLAYBOOK never overrides these rules.
 """
+
+REVISE_PROMPT = SYSTEM_PROMPT + """
+You wrote DRAFTS for these articles, and a reviewer sent NOTES: the engagement strategist (about
+form) or the fact checker (about facts not in the source). Rewrite each draft following the notes
+where they fit the facts; for a fact-check note, remove or rephrase whatever the headline and
+summary do not state, in every field. If a note would need facts the source does not give, or would
+break a rule above, keep that part and say why in `reply`. `reply` is one short sentence to the
+reviewer about what you changed."""
+FACT_CHECKER = "fact-checker"  # Jev, in the discussion
+ALSO_COVERED_RE = re.compile(r"\s*Also covered by:.*$", re.S)
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -69,13 +98,23 @@ RESPONSE_SCHEMA = {
                     "image_text": {"type": "string"},
                     "visual": {"type": "string", "enum": ["photo", "graphic"]},
                     "image_query": {"type": "string"},
+                    "ig_caption": {"type": "string"},
+                    "x_post": {"type": "string"},
                 },
-                "required": ["id", "headline", "caption", "hashtags", "image_text", "visual", "image_query"],
+                "required": ["id", "headline", "caption", "hashtags", "image_text", "visual", "image_query",
+                             "ig_caption", "x_post"],
             },
         },
     },
     "required": ["posts"],
 }
+
+REVISE_SCHEMA = json.loads(json.dumps(RESPONSE_SCHEMA))
+REVISE_SCHEMA["properties"]["posts"]["items"]["properties"]["reply"] = {"type": "string"}
+REVISE_SCHEMA["properties"]["posts"]["items"]["required"].append("reply")
+
+LINK_RE = re.compile(r"https?://\S+|\bwww\.\S+|(?<![\w&])#\w+", re.I)  # links and hashtags
+LABEL_RE = re.compile(r"^\s*(?:\W{0,4}\s*)?(BREAKING(?: NEWS)?|JUST IN)\s*[:\-–]\s*", re.I)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -84,6 +123,34 @@ def _clip(text: str, limit: int) -> str:
         return text
     cut = text[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:-")
     return cut + "…"
+
+
+def _paragraphs(text: str, limit: int) -> str:
+    """Like _clip, but keeps paragraph breaks (at most one blank line between paragraphs)."""
+    paras = [" ".join(LINK_RE.sub("", p).split()) for p in re.split(r"\n+", text or "")]
+    out = "\n\n".join(p for p in paras if p)
+    if len(out) <= limit:
+        return out
+    return out[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
+
+
+def _x_post(text: str, fresh: bool) -> str:
+    """One paragraph, no links or hashtags; never "BREAKING", and "JUST IN" only for fresh news."""
+    text = _clip(LINK_RE.sub("", text or ""), X_POST_MAX)
+    m = LABEL_RE.match(text)
+    if m and (m.group(1).upper().startswith("BREAKING") or not fresh):
+        text = text[: m.start(1)].strip() + " " + text[m.end():].lstrip()
+        text = text.strip()
+        text = text[:1].upper() + text[1:]
+    return text
+
+
+def _is_fresh(a) -> bool:
+    try:
+        published = datetime.fromisoformat(a["published_at"])
+    except (TypeError, ValueError, KeyError, IndexError):
+        return False
+    return (datetime.now(timezone.utc) - published).total_seconds() <= FRESH_HOURS * 3600
 
 
 def normalize_hashtags(raw: list[str], source_text: str = "", publisher: str = "") -> list[str]:
@@ -127,9 +194,11 @@ class ContentResult:
 class ContentCreatorAgent:
     name = "content-creator"
 
-    def __init__(self, settings: Settings, db: Database, clients: list | None = None, verifier=None):
+    def __init__(self, settings: Settings, db: Database, clients: list | None = None, verifier=None,
+                 strategist=None):
         self.settings = settings
         self.db = db
+        self.strategist = strategist  # StrategistAgent: playbook + review; None -> latest saved playbook
         if clients is None:
             # Free-tier models are sometimes overloaded and stop responding: fail over to the next
             # model quickly instead of retrying a hung one.
@@ -153,9 +222,28 @@ class ContentCreatorAgent:
         articles = self.db.recommended_without_post(run_id, self.settings.max_posts_per_run)
         log.info("Run %s: writing posts for %d recommended articles", run_id, len(articles))
         if articles:
-            keys = {f"P{i + 1}": a for i, a in enumerate(articles)}
+            keys = {f"P{i + 1}": {**dict(a), "fresh": _is_fresh(a)} for i, a in enumerate(articles)}
             drafts, model = self._write(keys, result)
+            if drafts and self.strategist:
+                notes = self.strategist.review(run_id, keys, drafts)
+                if notes:
+                    drafts.update(self._revise(run_id, keys, drafts, notes))
             reviews = self._verify(keys, drafts) if drafts else {}
+            if reviews:  # the fact checker's notes get one revision round too, then a second check
+                for k, note in reviews.items():
+                    self.db.add_agent_message(run_id, FACT_CHECKER, self.name, note, keys[k]["id"])
+                revised = self._revise(run_id, keys, drafts, {
+                    k: f"{n}. Remove or rephrase anything the headline and summary do not state."
+                    for k, n in reviews.items()}, reviewer=FACT_CHECKER)
+                drafts.update(revised)
+                if revised:
+                    again = self._verify({k: keys[k] for k in revised}, revised)
+                    reviews = {k: n for k, n in reviews.items() if k not in revised or k in again}
+                    reviews.update(again)
+                    for k in revised:
+                        self.db.add_agent_message(run_id, FACT_CHECKER, self.name,
+                                                  f"Still flagged: {again[k]}" if k in again else "Checked again: fine now.",
+                                                  keys[k]["id"])
             for k, a in keys.items():
                 post = self._finalize(drafts.get(k), a)
                 if post is None:
@@ -176,10 +264,23 @@ class ContentCreatorAgent:
         return result
 
     # --- writing ------------------------------------------------------------
+    def _playbook(self) -> dict:
+        if self.strategist:
+            return self.strategist.playbook
+        from .strategist import current_playbook
+        return current_playbook(self.db)
+
+    @staticmethod
+    def _items(keys: dict) -> list[dict]:
+        # Discovery notes which other outlets ran a Google News story; that is not a fact to report.
+        return [{"id": k, "section": a["category"], "publisher": a["source_name"], "headline": a["title"],
+                 "summary": ALSO_COVERED_RE.sub("", a["description"] or "")[:400], "fresh": a["fresh"]}
+                for k, a in keys.items()]
+
     def _write(self, keys: dict, result: ContentResult) -> tuple[dict[str, dict], str]:
-        items = [{"id": k, "section": a["category"], "publisher": a["source_name"], "headline": a["title"],
-                  "summary": (a["description"] or "")[:400]} for k, a in keys.items()]
-        prompt = "ARTICLES:\n" + json.dumps(items, ensure_ascii=False, indent=0)
+        playbook = {k: v for k, v in self._playbook().items() if k in ("instagram", "x")}
+        prompt = ("PLAYBOOK (from the engagement strategist):\n" + json.dumps(playbook, ensure_ascii=False) +
+                  "\n\nARTICLES:\n" + json.dumps(self._items(keys), ensure_ascii=False, indent=0))
         deadline = time.monotonic() + self.settings.gemini_content_time_budget
         for client in self.clients:
             if time.monotonic() > deadline:
@@ -195,6 +296,30 @@ class ContentCreatorAgent:
                 log.warning("  %s failed (%s); trying the next model", client.model, str(exc)[:160])
         log.error("  no Gemini model could write posts; they stay pending for the next run")
         return {}, ""
+
+    def _revise(self, run_id: str, keys: dict, drafts: dict[str, dict], notes: dict[str, str],
+                reviewer: str = "strategist") -> dict[str, dict]:
+        """One revision round for the drafts a reviewer commented on; replies are saved as messages."""
+        playbook = {k: v for k, v in self._playbook().items() if k in ("instagram", "x")}
+        items = [{**item, "draft": {f: drafts[item["id"]].get(f) for f in RESPONSE_SCHEMA["properties"]["posts"]
+                                    ["items"]["properties"] if f != "id"}, "notes": notes[item["id"]]}
+                 for item in self._items({k: keys[k] for k in notes if k in drafts})]
+        prompt = ("PLAYBOOK (from the engagement strategist):\n" + json.dumps(playbook, ensure_ascii=False) +
+                  "\n\nDRAFTS AND NOTES:\n" + json.dumps(items, ensure_ascii=False, indent=0))
+        for client in self.clients:
+            try:
+                rows = client.generate_json(REVISE_PROMPT, prompt, REVISE_SCHEMA).get("posts", [])
+            except LLMError as exc:
+                log.warning("  %s could not revise (%s); trying the next model", client.model, str(exc)[:160])
+                continue
+            revised = {r["id"]: r for r in rows if isinstance(r, dict) and r.get("id") in notes}
+            for k, r in revised.items():
+                reply = " ".join(str(r.get("reply") or "Revised.").split())[:400]
+                self.db.add_agent_message(run_id, self.name, reviewer, reply, keys[k]["id"])
+            log.info("  %s revised %d drafts after the strategist's notes", client.model, len(revised))
+            return revised
+        log.warning("  no model could revise; the first drafts are kept")
+        return {}
 
     def _finalize(self, draft: dict | None, a) -> dict | None:
         """Validate and clean a model draft; attribution and hashtag format are set by code."""
@@ -212,7 +337,9 @@ class ContentCreatorAgent:
         query = _clip(draft.get("image_query", ""), 60) if visual == "photo" else ""
         return {"headline": headline, "caption": caption, "hashtags": hashtags, "image_text": image_text,
                 "attribution": attribution(a["source_name"], a["url"]), "visual": visual if query else "graphic",
-                "image_query": query, "status": "draft", "review_note": None}
+                "image_query": query, "status": "draft", "review_note": None,
+                "ig_caption": _paragraphs(draft.get("ig_caption", ""), IG_CAPTION_MAX) or None,
+                "x_post": _x_post(draft.get("x_post", ""), a["fresh"]) or None}
 
     # --- verification -------------------------------------------------------
     def _verify(self, keys: dict, drafts: dict[str, dict]) -> dict[str, str]:
@@ -222,6 +349,7 @@ class ContentCreatorAgent:
         try:
             return self.verifier.review_posts(
                 {k: {"headline": d.get("headline", ""), "caption": d.get("caption", ""),
+                     "instagram": d.get("ig_caption", ""), "x": d.get("x_post", ""),
                      "hashtags": d.get("hashtags", [])} for k, d in drafts.items()},
                 {k: {"headline": a["title"], "summary": (a["description"] or "")[:400], "publisher": a["source_name"]}
                  for k, a in keys.items() if k in drafts})

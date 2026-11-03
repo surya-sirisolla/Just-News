@@ -22,6 +22,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Callable
 
+from .agents.publisher import field_of, instagram_caption, source_line
+from .agents.x_publisher import x_text
 from .config import Settings
 from .db import Database
 from .assistant import fallback
@@ -32,6 +34,8 @@ log = logging.getLogger("justnews.approval")
 STALE_SECONDS = 300  # older messages are only acted on if a shortlist is open
 CONTEXT_HOURS = 48   # how long a finished shortlist stays available for "send me the templates"
 PLATFORM_LABELS = {"instagram": "Instagram", "x": "X"}
+PREVIEW_MAX = 300   # characters of the Instagram caption shown in the shortlist
+CAPTION_LIMIT = 1000  # WhatsApp image captions are cut around 1024
 SHOW_WORDS = {"list", "show list", "shortlist"}
 NONE_WORDS = {"none", "skip", "0", "nothing"}
 YES_WORDS = {"yes", "y", "yes please", "yeah", "yep", "ok", "okay", "confirm", "go ahead", "sure", "haan", "ha", "avunu"}
@@ -116,7 +120,14 @@ class ApprovalService:
 
     @staticmethod
     def _format_item(n: str, p) -> str:
-        lines = [f"*{n}. {p['headline']}*", p["caption"], " ".join(json.loads(p["hashtags"])), p["attribution"],
+        ig, x = field_of(p, "ig_caption"), field_of(p, "x_post")
+        if ig or x:  # the platform versions; the full ones come with "send me the templates"
+            ig = " ".join((ig or "").split())  # one paragraph, so each story stays one block
+            preview = ig if len(ig) <= PREVIEW_MAX else ig[:PREVIEW_MAX - 1].rsplit(" ", 1)[0] + "…"
+            body = [f"📸 {preview}"] * bool(ig) + [f"𝕏 {x}"] * bool(x)
+        else:
+            body = [p["caption"]]
+        lines = [f"*{n}. {p['headline']}*", *body, " ".join(json.loads(p["hashtags"])), source_line(p),
                  f"_{p['category']}_" + (f" · score {p['overall']}" if p["overall"] is not None else "")]
         if p["status"] == "needs_review":
             lines.append(f"⚠️ {p['review_note']}")
@@ -219,6 +230,7 @@ class ApprovalService:
                          "posted": [PLATFORM_LABELS.get(x, x) for x in self.db.published_platforms(aid)],
                          "template": posts[aid]["image_path"], "caption": posts[aid]["caption"],
                          "hashtags": " ".join(json.loads(posts[aid]["hashtags"])),
+                         "instagram_text": instagram_caption(posts[aid]), "x_text": x_text(posts[aid]),
                          "attribution": posts[aid]["attribution"]}
                 for n, aid in json.loads(req["items"]).items() if aid in posts}
 
@@ -268,9 +280,9 @@ class ApprovalService:
             return self._reply(f"{hint} Reply with the numbers from the list and I'll make them.", "no templates to send")
         self._send(reply or "Here you go 👇")
         for n in to_send[:10]:
-            s = stories[n]
-            self.client.send_image(self.owner, s["template"],
-                                   f"*{n}. {s['headline']}*\n{s['caption']}\n{s['hashtags']}\n{s['attribution']}")
+            s = stories[n]  # exactly what each platform gets
+            self.client.send_image(self.owner, s["template"], f"*{n}.* 📸 Instagram\n{s['instagram_text']}"[:CAPTION_LIMIT])
+            self._send(f"*{n}.* 𝕏 X\n{s['x_text']}")
         if missing:
             one = len(missing) == 1
             self._send(f"{_join(missing)} {'is not' if one else 'are not'} made yet. "

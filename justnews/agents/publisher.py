@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +32,8 @@ log = logging.getLogger("justnews.publisher")
 
 PLATFORM = "instagram"
 CAPTION_MAX = 2200
-HASHTAG_MAX = 30
+HASHTAG_MAX = 5  # Instagram's own limit per post
+INSIGHT_NAMES = {"reach": "reach", "saved": "saves", "shares": "shares", "views": "views"}
 URL_LIFETIME = 3600
 POLL_SECONDS, POLL_ATTEMPTS = 3, 20
 TIMEOUT = 60
@@ -52,10 +54,34 @@ def to_jpeg(path: str) -> bytes:
     return buf.getvalue()
 
 
+def field_of(p, key: str):
+    """A post column that older rows (or test dicts) may not have."""
+    try:
+        return p[key]
+    except (KeyError, IndexError):
+        return None
+
+
+TRACKING_RE = re.compile(r"[?&](?:utm_\w+|at_\w+|traffic_source|ref|cmpid|ocid)=[^&]*")
+
+
+def source_line(p) -> str:
+    """The attribution, without the link when it is a long Google News redirect and without
+    tracking parameters otherwise."""
+    if "news.google.com/" in (field_of(p, "url") or "") and field_of(p, "source_name"):
+        return f"Source: {p['source_name']}"
+    text = p["attribution"]
+    while TRACKING_RE.search(text):
+        text = TRACKING_RE.sub(lambda m: "?" if m.group(0)[0] == "?" else "", text, count=1)
+    return re.sub(r"\?&", "?", text).rstrip("?&")
+
+
 def instagram_caption(p) -> str:
-    """Headline, caption, hashtags, source and (for licensed photos) the photo credit."""
+    """The Instagram version (or headline + caption for older posts), hashtags, source and (for
+    licensed photos) the photo credit."""
+    body = field_of(p, "ig_caption") or "\n\n".join(x for x in (p["headline"], p["caption"]) if x)
     tags = json.loads(p["hashtags"])[:HASHTAG_MAX]
-    parts = [p["headline"], p["caption"], " ".join(tags), p["attribution"]]
+    parts = [body, " ".join(tags), source_line(p)]
     if p["image_kind"] == "photo" and p["image_credit"]:
         parts.append(p["image_credit"])  # CC BY/BY-SA require attribution
     text = "\n\n".join(x for x in parts if x)
@@ -199,6 +225,7 @@ class InstagramPublisher(Publisher):
         self.session.headers["Authorization"] = f"Bearer {settings.instagram_token}"
         self.base = f"https://graph.facebook.com/{settings.instagram_api_version}"
         self.ig = settings.instagram_user_id
+        self.insights: bool | None = None  # unknown until the first insights call
 
     # --- Graph API ----------------------------------------------------------------
     def _call(self, method: str, path: str, retries: int = 0, **data) -> dict:
@@ -237,6 +264,56 @@ class InstagramPublisher(Publisher):
     def remaining_quota(self) -> int:
         data = self._call("GET", f"{self.ig}/content_publishing_limit", retries=2, fields="quota_usage,config")["data"][0]
         return data["config"]["quota_total"] - data["quota_usage"]
+
+    # --- reading engagement (for the strategist) ----------------------------------------
+    def metrics(self, media_ids: list[str]) -> dict[str, dict]:
+        """Likes and comments of our posts, plus reach, views, saves and shares when the token has
+        the instagram_manage_insights permission."""
+        out: dict[str, dict] = {}
+        for mid in media_ids:
+            try:
+                m = self._call("GET", mid, retries=1, fields="like_count,comments_count")
+            except PublishError as exc:
+                log.warning("  could not read Instagram post %s: %s", mid, exc)
+                if exc.fatal:
+                    break
+                continue
+            row = {"likes": m.get("like_count"), "comments": m.get("comments_count")}
+            if self.insights is not False:
+                try:
+                    data = self._call("GET", f"{mid}/insights", retries=1, metric=",".join(INSIGHT_NAMES)).get("data", [])
+                    for d in data:
+                        value = (d.get("values") or [{}])[0].get("value", d.get("total_value", {}).get("value"))
+                        if d.get("name") in INSIGHT_NAMES:
+                            row[INSIGHT_NAMES[d["name"]]] = value
+                    self.insights = True
+                except PublishError as exc:
+                    if exc.fatal:  # (#10): the token lacks instagram_manage_insights
+                        log.info("  Instagram insights unavailable (%s); reading likes and comments only", exc)
+                        self.insights = False
+            out[mid] = row
+        return out
+
+    def benchmark(self, accounts: list[str], per_account: int) -> list[dict]:
+        """Recent posts of other public business/creator accounts (Business Discovery)."""
+        posts = []
+        for user in accounts:
+            query = ("business_discovery.username(" + user + "){followers_count,media.limit(" + str(per_account) +
+                     "){id,caption,like_count,comments_count,timestamp,media_type,media_product_type}}")
+            try:
+                found = self._call("GET", self.ig, retries=1, fields=query)["business_discovery"]
+            except PublishError as exc:
+                log.warning("  Instagram benchmark @%s unavailable: %s", user, exc)
+                if exc.fatal:  # a missing permission fails the same way for every account
+                    break
+                continue
+            for m in found.get("media", {}).get("data", []):
+                kind = "REEL" if m.get("media_product_type") == "REELS" else m.get("media_type")
+                posts.append({"post_id": m["id"], "account": user, "followers": found.get("followers_count"),
+                              "text": (m.get("caption") or "")[:1000], "media_type": kind,
+                              "likes": m.get("like_count"), "comments": m.get("comments_count"),
+                              "posted_at": m.get("timestamp")})
+        return posts
 
     # --- publishing -------------------------------------------------------------------
     def _publish_one(self, run_id: str, p) -> tuple[str, str]:

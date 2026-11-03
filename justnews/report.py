@@ -6,6 +6,8 @@ import json
 import os
 from datetime import datetime
 
+from .agents.publisher import instagram_caption
+from .agents.x_publisher import x_text
 from .config import PROJECT_ROOT
 from .db import Database
 
@@ -33,12 +35,15 @@ def build_report(db: Database, run_id: str) -> dict:
         for r in rows
     ]
     usage = [dict(u) for u in db.llm_usage_for_run(run_id)]
+    headlines = {p["article_id"]: p["headline"] for p in db.posts_for_run(run_id)}
+    playbook = db.latest_playbook()
     posts = [
         {
             "headline": p["headline"], "caption": p["caption"], "hashtags": json.loads(p["hashtags"]),
             "attribution": p["attribution"], "image_text": p["image_text"], "status": p["status"],
             "review_note": p["review_note"], "category": p["category"], "article_title": p["title"],
-            "model": p["model"], "approval": p["approval"] or "not requested", "image": p["image_path"] and {
+            "model": p["model"], "approval": p["approval"] or "not requested",
+            "instagram_text": instagram_caption(p), "x_text": x_text(p), "image": p["image_path"] and {
                 "kind": p["image_kind"], "path": p["image_path"], "credit": p["image_credit"],
                 "license": p["image_license"], "source_page": p["image_source"], "note": p["image_note"]},
         }
@@ -53,6 +58,13 @@ def build_report(db: Database, run_id: str) -> dict:
         "images": run.get("images") or {},
         "llm_usage": usage,
         "posts": posts,
+        "strategy": {
+            "stats": run.get("strategy") or {},
+            "playbook": json.loads(playbook["playbook"]) if playbook else None,
+            "playbook_from": playbook and f"{playbook['model']}, {_date(playbook['created_at'])}",
+            "discussion": [{"from": m["sender"], "to": m["recipient"], "post": headlines.get(m["article_id"]),
+                            "message": m["body"]} for m in db.agent_messages(run_id)],
+        },
         "recommended": [a for a in articles if a["decision"] == "Recommended"],
         "rejected": [a for a in articles if a["decision"] == "Rejected"],
     }
@@ -103,6 +115,7 @@ def render_markdown(report: dict) -> str:
 
     if report["posts"]:
         out += _posts_section(report)
+    out += _strategy_section(report["strategy"])
     out += ["## Recommended for posting", ""]
     for a in report["recommended"]:
         out += _article_block(a)
@@ -112,6 +125,28 @@ def render_markdown(report: dict) -> str:
     for a in report["rejected"]:
         out += _article_block(a)
     return "\n".join(out)
+
+
+def _strategy_section(st: dict) -> list[str]:
+    if not st.get("playbook") and not st.get("discussion"):
+        return []
+    out = ["## Engagement strategy", ""]
+    if st.get("stats"):
+        out += [", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in st["stats"].items()), ""]
+    if st.get("playbook"):
+        pb = st["playbook"]
+        out += [f"Playbook ({st['playbook_from']}):", ""]
+        for title, key in (("Instagram", "instagram"), ("X", "x"), ("What other news accounts do", "observations"),
+                           ("To try next", "experiments")):
+            if pb.get(key):
+                out += [f"**{title}**", *[f"- {r}" for r in pb[key]], ""]
+    if st.get("discussion"):
+        out += ["### Discussion between the agents", ""]
+        for m in st["discussion"]:
+            about = f" about *{m['post']}*" if m["post"] else ""
+            out.append(f"- **{m['from']} → {m['to']}**{about}: {m['message']}")
+        out.append("")
+    return out
 
 
 def _posts_section(report: dict) -> list[str]:
@@ -128,7 +163,7 @@ def _posts_section(report: dict) -> list[str]:
         if p["image"]:
             rel = os.path.relpath(p["image"]["path"], REPORTS_DIR)
             out += [f"![{p['image_text']}]({rel})", ""]
-        out += [p["caption"], "", " ".join(p["hashtags"]), "", p["attribution"], "",
+        out += ["**Instagram**", "", p["instagram_text"], "", "**X**", "", p["x_text"], "",
                 f"- Status: {status}" + (f" ({p['review_note']})" if p["review_note"] else ""),
                 f"- Approval: {p['approval']}",
                 f"- Image text: {p['image_text']}"]

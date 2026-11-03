@@ -25,13 +25,13 @@ import requests
 
 from ..config import Settings
 from ..db import Database
-from .publisher import TIMEOUT, Publisher, PublishError, to_jpeg
+from .publisher import TIMEOUT, Publisher, PublishError, field_of, to_jpeg
 
 log = logging.getLogger("justnews.publisher")
 
 API = "https://api.x.com/2"
 TEXT_MAX = 280
-HASHTAG_MAX = 3
+HASHTAG_MAX = 2  # hashtags add little reach on X; more than a couple reads as spam
 NO_CREDITS = "X needs Pay-Per-Use credits for posting (console.x.com → Billing)"
 
 URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.I)
@@ -82,14 +82,16 @@ def _cut(text: str, room: int) -> str:
 
 
 def x_text(p) -> str:
-    """Headline, caption, hashtags, source and (for licensed photos) the photo credit, in 280.
-    The caption, then hashtags, are dropped first when everything doesn't fit."""
-    headline = _unlink(p["headline"])
+    """The X version written by the content creator (or headline + caption for older posts), up to
+    two hashtags, the source and (for licensed photos) the photo credit, in 280. Hashtags, then the
+    caption, are dropped first when everything doesn't fit."""
+    x_post = _unlink(field_of(p, "x_post") or "")
+    headline = x_post or _unlink(p["headline"])
     source = f"Source: {_unlink(p['source_name'])}"
     if p["image_kind"] == "photo" and p["image_credit"]:
         source += f" · {_unlink(p['image_credit'])}"  # CC BY/BY-SA require attribution
     tags = json.loads(p["hashtags"])[:HASHTAG_MAX]
-    caption = _unlink(p["caption"])
+    caption = "" if x_post else _unlink(p["caption"])
     for parts in ([headline, caption, " ".join(tags), source], [headline, " ".join(tags), source],
                   [headline, " ".join(tags[:1]), source], [headline, source]):
         text = "\n\n".join(x for x in parts if x)
@@ -156,6 +158,53 @@ class XPublisher(Publisher):
             if _comparable(t.get("text")) == text:
                 return t["id"], f"https://x.com/i/status/{t['id']}"
         return None
+
+    # --- reading engagement (for the strategist; X charges $0.005 per post read) ---------
+    @staticmethod
+    def _metrics_of(t: dict) -> dict:
+        m = t.get("public_metrics", {})
+        return {"likes": m.get("like_count"), "comments": m.get("reply_count"),
+                "shares": (m.get("retweet_count") or 0) + (m.get("quote_count") or 0),
+                "saves": m.get("bookmark_count"), "views": m.get("impression_count")}
+
+    def metrics(self, media_ids: list[str]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for i in range(0, len(media_ids), 100):
+            try:
+                data = self._call("GET", "tweets", retries=1, params={
+                    "ids": ",".join(media_ids[i:i + 100]), "tweet.fields": "public_metrics"}).get("data", [])
+            except PublishError as exc:
+                log.warning("  could not read X metrics: %s", exc)
+                break
+            out.update({t["id"]: self._metrics_of(t) for t in data})
+        return out
+
+    def benchmark(self, accounts: list[str], per_account: int) -> list[dict]:
+        """Recent original posts (no replies or reposts) of other accounts."""
+        try:
+            users = self._call("GET", "users/by", retries=1, params={
+                "usernames": ",".join(accounts), "user.fields": "public_metrics"}).get("data", [])
+        except PublishError as exc:
+            log.warning("  X benchmarks unavailable: %s", exc)
+            return []
+        posts = []
+        for u in users:
+            try:
+                tweets = self._call("GET", f"users/{u['id']}/tweets", retries=1, params={
+                    "max_results": max(5, min(per_account, 100)), "exclude": "replies,retweets",
+                    "tweet.fields": "public_metrics,created_at,attachments"}).get("data", [])
+            except PublishError as exc:
+                log.warning("  X benchmark @%s unavailable: %s", u.get("username"), exc)
+                if exc.fatal:
+                    break
+                continue
+            for t in tweets[:per_account]:
+                posts.append({"post_id": t["id"], "account": u["username"],
+                              "followers": u.get("public_metrics", {}).get("followers_count"),
+                              "text": t.get("text", "")[:1000],
+                              "media_type": "media" if t.get("attachments", {}).get("media_keys") else "text",
+                              "posted_at": t.get("created_at"), **self._metrics_of(t)})
+        return posts
 
     def _publish_one(self, run_id: str, p) -> tuple[str, str]:
         media = self._call("POST", "media/upload", retries=1, data={"media_category": "tweet_image"},
