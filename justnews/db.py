@@ -151,6 +151,8 @@ class Database:
             self.conn.execute("ALTER TABLE posts ADD COLUMN approval TEXT")
         if "media_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}:
             self.conn.execute("ALTER TABLE wa_outbox ADD COLUMN media_path TEXT")
+        if "attempts" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(publications)")}:
+            self.conn.execute("ALTER TABLE publications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
         if "pending" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(approval_requests)")}:
             # JSON list of story numbers awaiting the owner's "yes" (approvals given in free text)
             self.conn.execute("ALTER TABLE approval_requests ADD COLUMN pending TEXT")
@@ -381,9 +383,18 @@ class Database:
 
     def save_publication(self, article_id: str, platform: str, status: str, media_id: str | None = None,
                          permalink: str | None = None, error: str | None = None) -> None:
+        previous = self.publication(article_id, platform)
+        attempts = (previous["attempts"] + 1) if previous is not None and status == "failed" else 1
         with self.tx() as c:
-            c.execute("INSERT OR REPLACE INTO publications VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (article_id, platform, status, media_id, permalink, error, _now()))
+            c.execute("INSERT OR REPLACE INTO publications(article_id, platform, status, media_id, permalink, error, "
+                      "updated_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (article_id, platform, status, media_id, permalink, error, _now(), attempts))
+
+    def failed_publications(self, platform: str, max_attempts: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT pub.article_id, p.run_id FROM publications pub JOIN posts p ON p.article_id = pub.article_id
+               WHERE pub.platform = ? AND pub.status = 'failed' AND pub.attempts < ? AND p.approval = 'approved'""",
+            (platform, max_attempts)).fetchall()
 
     def published_since(self, platform: str, hours: float) -> int:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")

@@ -174,9 +174,26 @@ def cmd_report(db: Database, args) -> str:
     return run_id
 
 
+def retry_failed_posts(db: Database) -> None:
+    """Approved posts that failed last time are retried (or found to be live) before new news."""
+    if not settings.instagram_enabled:
+        return
+    try:
+        result = InstagramPublisher(settings, db).retry_failed()
+    except Exception:
+        log.exception("Retrying failed Instagram posts failed")
+        return
+    if result.posted and settings.whatsapp_enabled:
+        links = "\n".join(link for _, link in result.posted if link)
+        OutboxClient(db).send_text(settings.whatsapp_owner,
+                                   f"Update: {len(result.posted)} earlier post{'s are' if len(result.posted) != 1 else ' is'} "
+                                   f"now confirmed on Instagram ✅\n{links}")
+
+
 def run_cycle(db: Database, run_id: str | None = None) -> str:
     """Agents 1-3, then the WhatsApp shortlist (or Agent 4 for every draft without WhatsApp)."""
     run_id = run_id or new_run_id()
+    retry_failed_posts(db)
     NewsDiscoveryAgent(settings, db).run(run_id)
     NewsEvaluatorAgent(settings, db).run(run_id)
     try:

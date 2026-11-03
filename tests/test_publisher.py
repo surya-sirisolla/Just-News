@@ -37,27 +37,51 @@ class FakeStore:
 class FakeGraph:
     """Answers like the Instagram Graph API; `fail` makes a matching call return an error."""
 
-    def __init__(self, statuses=("IN_PROGRESS", "FINISHED"), quota_used=0, fail=None):
+    def __init__(self, statuses=("IN_PROGRESS", "FINISHED"), quota_used=0, fail=None, publish_timeout=None,
+                 flaky_gets=0):
         self.headers, self.calls = {}, []
         self.statuses, self.quota_used, self.fail = list(statuses), quota_used, fail
         self.n = 0
+        self.live = []          # media actually on the account: (id, caption, permalink)
+        self.captions = {}      # container id -> caption
+        self.published = set()  # container ids that went live
+        self.publish_timeout = publish_timeout  # None, "after_publishing" or "before_publishing"
+        self.flaky_gets = flaky_gets
 
     def request(self, method, url, data=None, params=None, timeout=None):
         path = url.split("/v23.0/", 1)[1]
         self.calls.append((method, path, data or params))
+        if method == "GET" and self.flaky_gets:
+            self.flaky_gets -= 1
+            import requests
+            raise requests.ReadTimeout("slow")
         if self.fail and self.fail[0] in path:
             return NS(status_code=400, content=b"x", text="err", json=lambda: {"error": {"code": self.fail[1], "message": "nope"}})
         if path.endswith("content_publishing_limit"):
             body = {"data": [{"quota_usage": self.quota_used, "config": {"quota_total": 100, "quota_duration": 86400}}]}
+        elif path.endswith("/media") and method == "GET":
+            body = {"data": [{"id": i, "caption": c, "permalink": l} for i, c, l in reversed(self.live)]}
         elif path.endswith("/media"):
             self.n += 1
+            self.captions[f"container{self.n}"] = data["caption"]
             body = {"id": f"container{self.n}"}
         elif path.startswith("container"):
-            body = {"status_code": self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]}
+            if path in self.published:
+                body = {"status_code": "PUBLISHED"}
+            else:
+                body = {"status_code": self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]}
         elif path.endswith("media_publish"):
-            body = {"id": f"media{self.n}"}
+            cid = data["creation_id"]
+            mode, self.publish_timeout = self.publish_timeout, None
+            if mode != "before_publishing":
+                self.published.add(cid)
+                self.live.append((f"media{cid[-1]}", self.captions[cid], f"https://www.instagram.com/p/POST{cid[-1]}/"))
+            if mode:
+                import requests
+                raise requests.ReadTimeout("Read timed out. (read timeout=60)")
+            body = {"id": f"media{cid[-1]}"}
         else:
-            body = {"permalink": f"https://www.instagram.com/p/POST{self.n}/"}
+            body = {"permalink": f"https://www.instagram.com/p/POST{path[-1]}/"}
         return NS(status_code=200, content=b"x", json=lambda: body)
 
 
@@ -127,6 +151,44 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(sum(1 for c in self.graph.calls if c[1].endswith("/media")), 1)  # stopped after the first
         result = self.publisher(FakeGraph(statuses=("ERROR",))).publish("r1", [self.ids[1]])
         self.assertIn("could not process", result.failed[0][1])
+
+    def test_timeout_after_instagram_published_counts_as_posted_once(self):
+        result = self.publisher(FakeGraph(publish_timeout="after_publishing")).publish("r1", [self.ids[1]])
+        self.assertEqual(result.posted, [(self.ids[1], "https://www.instagram.com/p/POST1/")])
+        self.assertEqual(len(self.graph.live), 1)
+        self.assertEqual(self.db.publication(self.ids[1], "instagram")["status"], "published")
+
+    def test_timeout_before_publishing_is_a_failure_then_retried_next_cycle(self):
+        graph = FakeGraph(publish_timeout="before_publishing")
+        result = self.publisher(graph).publish("r1", [self.ids[1]])
+        self.assertEqual(len(result.failed), 1)
+        self.assertEqual(graph.live, [])
+        self.db.set_post_approval([self.ids[1]], "approved")
+        pub = InstagramPublisher(self.settings, self.db, store=self.store, session=graph, sleep=lambda s: None)
+        again = pub.retry_failed()
+        self.assertEqual(len(again.posted), 1)
+        self.assertEqual(len(graph.live), 1)
+
+    def test_retry_finds_a_post_that_went_live_instead_of_posting_again(self):
+        graph = FakeGraph()
+        pub = self.publisher(graph)
+        pub.publish("r1", [self.ids[1]])
+        self.db.save_publication(self.ids[1], "instagram", "failed", error="ReadTimeout")  # what we wrongly recorded
+        self.db.set_post_approval([self.ids[1]], "approved")
+        result = pub.retry_failed()
+        self.assertEqual([link for _, link in result.posted], ["https://www.instagram.com/p/POST1/"])
+        self.assertEqual(len(graph.live), 1)  # not posted twice
+        self.assertEqual(self.db.publication(self.ids[1], "instagram")["status"], "published")
+
+    def test_retries_stop_after_three_attempts(self):
+        self.db.set_post_approval([self.ids[1]], "approved")
+        for _ in range(3):
+            self.db.save_publication(self.ids[1], "instagram", "failed", error="boom")
+        self.assertEqual(self.db.failed_publications("instagram", 3), [])
+
+    def test_transient_read_errors_are_retried(self):
+        result = self.publisher(FakeGraph(flaky_gets=2)).publish("r1", [self.ids[0]])
+        self.assertEqual(len(result.posted), 1)
 
     def test_caption_respects_instagram_limits(self):
         p = {"headline": "H", "caption": "c" * 3000, "hashtags": '["#a"]', "attribution": "Source: X",

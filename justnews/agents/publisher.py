@@ -33,6 +33,8 @@ CAPTION_MAX = 2200
 HASHTAG_MAX = 30
 URL_LIFETIME = 3600
 POLL_SECONDS, POLL_ATTEMPTS = 3, 20
+TIMEOUT = 60
+MAX_ATTEMPTS = 3  # a failed post is retried in later cycles up to this many times
 
 
 class PublishError(Exception):
@@ -100,21 +102,41 @@ class InstagramPublisher:
         self.sleep = sleep
 
     # --- Graph API ----------------------------------------------------------------
-    def _call(self, method: str, path: str, **data) -> dict:
-        try:
-            resp = self.session.request(method, f"{self.base}/{path}", data=data if method == "POST" else None,
-                                        params=data if method == "GET" else None, timeout=30)
-        except requests.RequestException as exc:
-            raise PublishError(f"{type(exc).__name__}: {exc}") from exc
-        body = resp.json() if resp.content else {}
-        if resp.status_code != 200:
-            err = body.get("error", {})
-            fatal = err.get("code") in (10, 190, 200) or resp.status_code in (401, 403)
-            raise PublishError(f"Instagram error {err.get('code')}: {err.get('message', resp.text[:200])}", fatal)
-        return body
+    def _call(self, method: str, path: str, retries: int = 0, **data) -> dict:
+        """One Graph API call. Only pass `retries` for calls that are safe to repeat: reads, and
+        creating a container (an unpublished container just expires). Never media_publish."""
+        for attempt in range(retries + 1):
+            try:
+                resp = self.session.request(method, f"{self.base}/{path}", data=data if method == "POST" else None,
+                                            params=data if method == "GET" else None, timeout=TIMEOUT)
+            except requests.RequestException as exc:
+                error = PublishError(f"{type(exc).__name__}: {exc}")
+            else:
+                body = resp.json() if resp.content else {}
+                if resp.status_code == 200:
+                    return body
+                err = body.get("error", {})
+                fatal = err.get("code") in (10, 190, 200) or resp.status_code in (401, 403)
+                error = PublishError(f"Instagram error {err.get('code')}: {err.get('message', resp.text[:200])}", fatal)
+                if fatal or resp.status_code < 500:
+                    raise error
+            if attempt < retries:
+                self.sleep(2 * (attempt + 1))
+        raise error
+
+    def _recent_media(self) -> list[dict]:
+        return self._call("GET", f"{self.ig}/media", retries=2, fields="id,caption,permalink", limit=25).get("data", [])
+
+    def _find_live(self, p, recent: list[dict] | None = None) -> tuple[str, str] | None:
+        """(media id, permalink) if this exact post is already live on the account."""
+        caption = instagram_caption(p)
+        for m in recent if recent is not None else self._recent_media():
+            if (m.get("caption") or "").strip() == caption.strip():
+                return m["id"], m.get("permalink", "")
+        return None
 
     def remaining_quota(self) -> int:
-        data = self._call("GET", f"{self.ig}/content_publishing_limit", fields="quota_usage,config")["data"][0]
+        data = self._call("GET", f"{self.ig}/content_publishing_limit", retries=2, fields="quota_usage,config")["data"][0]
         return data["config"]["quota_total"] - data["quota_usage"]
 
     # --- publishing -------------------------------------------------------------------
@@ -163,9 +185,9 @@ class InstagramPublisher:
             url = self.store.put(key, to_jpeg(p["image_path"]))
         except Exception as exc:  # S3 credentials, bucket or network
             raise PublishError(f"could not upload the image to S3: {exc}") from exc
-        container = self._call("POST", f"{self.ig}/media", image_url=url, caption=instagram_caption(p))["id"]
+        container = self._call("POST", f"{self.ig}/media", retries=1, image_url=url, caption=instagram_caption(p))["id"]
         for _ in range(POLL_ATTEMPTS):  # Instagram downloads and processes the image first
-            status = self._call("GET", container, fields="status_code,status").get("status_code")
+            status = self._call("GET", container, retries=2, fields="status_code,status").get("status_code")
             if status == "FINISHED":
                 break
             if status in ("ERROR", "EXPIRED"):
@@ -173,10 +195,56 @@ class InstagramPublisher:
             self.sleep(POLL_SECONDS)
         else:
             raise PublishError("Instagram took too long to process the image")
-        media_id = self._call("POST", f"{self.ig}/media_publish", creation_id=container)["id"]
-        link = self._call("GET", media_id, fields="permalink").get("permalink", "")
+        try:
+            media_id = self._call("POST", f"{self.ig}/media_publish", creation_id=container)["id"]
+        except PublishError as exc:
+            # A slow answer doesn't mean it failed: Instagram may have published anyway. Check
+            # before reporting failure, so a later retry can't post the same story twice.
+            if exc.fatal:
+                raise
+            status = self._call("GET", container, retries=2, fields="status_code").get("status_code")
+            live = self._find_live(p) if status == "PUBLISHED" else None
+            if live is None:
+                raise
+            log.warning("  publish call timed out but the post is live: %s", live[1])
+            media_id = live[0]
+        try:
+            link = self._call("GET", media_id, retries=2, fields="permalink").get("permalink", "")
+        except PublishError:
+            link = ""  # it's posted; a missing link must not turn that into a failure
         try:
             self.store.delete(key)  # Instagram has its own copy now
         except Exception:
             log.warning("  could not delete %s from S3 (the lifecycle rule will)", key)
         return media_id, link
+
+    def retry_failed(self) -> PublishResult:
+        """Next-cycle retry of approved posts that failed. Anything that actually went live is first
+        reconciled as posted, so a retry never duplicates a post."""
+        result = PublishResult()
+        failed = self.db.failed_publications(PLATFORM, MAX_ATTEMPTS)
+        if not failed:
+            return result
+        try:
+            recent = self._recent_media()
+        except PublishError as exc:
+            log.warning("Could not check Instagram before retrying: %s", exc)
+            return result
+        retry: dict[str, list[str]] = {}
+        for row in failed:
+            p = next((x for x in self.db.posts_for_run(row["run_id"]) if x["article_id"] == row["article_id"]), None)
+            if p is None:
+                continue
+            live = self._find_live(p, recent)
+            if live:
+                self.db.save_publication(p["article_id"], PLATFORM, "published", media_id=live[0], permalink=live[1])
+                result.posted.append((p["article_id"], live[1]))
+                log.info("  reconciled: %r was already live at %s", p["headline"][:50], live[1])
+            else:
+                retry.setdefault(row["run_id"], []).append(p["article_id"])
+        for run_id, ids in retry.items():
+            again = self.publish(run_id, ids)
+            result.posted += again.posted
+            result.failed += again.failed
+            result.skipped += again.skipped
+        return result
