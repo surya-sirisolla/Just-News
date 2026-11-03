@@ -6,7 +6,11 @@ PicoClaw skills call), or both together with `run`.
   python -m justnews report   [RUN_ID]   # structured report (--format md|json)
   python -m justnews create   [RUN_ID]   # Agent 3: draft posts for recommended articles
   python -m justnews design   [RUN_ID]   # Agent 4: an image for each draft post
-  python -m justnews run                 # all four agents, then the report
+  python -m justnews whatsapp            # WhatsApp bridge: link a spare number (QR), then keep running
+  python -m justnews request-approval [RUN_ID]  # queue the shortlist for the owner on WhatsApp
+  python -m justnews reply "1 3"         # apply an approval reply from the command line
+  python -m justnews run                 # agents 1-3, then the approval request (or agent 4 if
+                                         # WhatsApp isn't configured), then the report
 """
 
 from __future__ import annotations
@@ -15,15 +19,19 @@ import argparse
 import json
 import logging
 import sys
+import uuid
 from datetime import datetime, timezone
 
 from .agents.content import ContentCreatorAgent
 from .agents.discovery import NewsDiscoveryAgent
 from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
+from .approval import ApprovalService
+from .assistant import Assistant
+from .whatsapp import Incoming, OutboxClient, WhatsAppBridge, WhatsAppError, bridge_running
 from .config import settings
 from .db import Database
-from .llm import LLMError
+from .llm import GeminiClient, LLMError
 from .logging_setup import setup_logging
 from .report import REPORTS_DIR, build_report, render
 
@@ -72,6 +80,66 @@ def cmd_design(db: Database, args) -> str:
     return run_id
 
 
+class ConsoleClient:
+    """Stand-in for WhatsApp when it isn't configured: prints the messages instead."""
+
+    def send_text(self, to: str, text: str) -> str:
+        print(f"\n----- WhatsApp message -----\n{text}\n----------------------------")
+        return f"console-{uuid.uuid4().hex[:12]}"
+
+    def send_image(self, to: str, path: str, caption: str) -> str:
+        print(f"\n----- WhatsApp image: {path} -----\n{caption}\n----------------------------")
+        return f"console-{uuid.uuid4().hex[:12]}"
+
+
+def approval_service(db: Database) -> ApprovalService:
+    def designer(run_id: str, article_ids: list[str]):
+        return ImageDesignerAgent(settings, db).run(run_id, article_ids)
+
+    assistant = None
+    if settings.gemini_api_key:
+        assistant = Assistant([GeminiClient(settings.gemini_api_key, m, 0.0, 0.0, thinking_level="minimal",
+                                            min_interval=settings.gemini_min_interval, temperature=0.6,
+                                            timeout=20, retries=0) for m in settings.gemini_chat_models])
+    if settings.whatsapp_enabled:
+        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant)
+    log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
+    return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant)
+
+
+def cmd_request_approval(db: Database, args) -> str:
+    run_id = _resolve_run(db, args.run_id)
+    result = approval_service(db).request(run_id)
+    if settings.whatsapp_enabled:
+        running = bridge_running(settings.whatsapp_heartbeat)
+        result = {"channel": "whatsapp", "bridge_running": running, **result}
+        if not running and result.get("requested"):
+            result["status"] = "queued; sent when the WhatsApp bridge runs (python -m justnews whatsapp)"
+    else:
+        result = {"channel": "console (WHATSAPP_OWNER_NUMBER not set)", **result}
+    print(json.dumps(result, indent=2))
+    return run_id
+
+
+def cmd_reply(db: Database, args) -> str:
+    service = approval_service(db)
+    outcome = service.handle_message(Incoming(f"cli-{uuid.uuid4().hex[:12]}", service.owner, args.text, 0))
+    print(json.dumps({"outcome": outcome}))
+    return ""
+
+
+def cmd_whatsapp(db: Database, args) -> str:
+    if not settings.whatsapp_enabled:
+        raise SystemExit("Set WHATSAPP_OWNER_NUMBER in .env (your own number, with country code, no +) first.")
+    service = approval_service(db)
+    bridge = WhatsAppBridge(settings.whatsapp_session, settings.whatsapp_owner, db, service.handle_message,
+                            settings.whatsapp_heartbeat, settings.whatsapp_qr_png,
+                            pair_phone=(args.pair_code or "").lstrip("+").replace(" ", "") or None)
+    log.info("Starting the WhatsApp bridge (Ctrl+C to stop); session file: %s", settings.whatsapp_session)
+    bridge.run()
+    return ""
+
+
 def cmd_report(db: Database, args) -> str:
     run_id = _resolve_run(db, args.run_id)
     report = build_report(db, run_id)
@@ -92,7 +160,11 @@ def cmd_run(db: Database, args) -> str:
         ContentCreatorAgent(settings, db).run(run_id)
     except LLMError as exc:  # e.g. no Gemini key: keep the evaluation results and report them
         log.error("Skipping post creation: %s", exc)
-    ImageDesignerAgent(settings, db).run(run_id)
+    if settings.whatsapp_enabled:
+        # Queued for the WhatsApp bridge; images are made only for the posts the owner picks.
+        approval_service(db).request(run_id)
+    else:
+        ImageDesignerAgent(settings, db).run(run_id)
     args.run_id = run_id
     return cmd_report(db, args)
 
@@ -101,11 +173,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="justnews", description="Just News agents")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn in [("discover", cmd_discover), ("evaluate", cmd_evaluate), ("create", cmd_create),
-                     ("design", cmd_design), ("report", cmd_report), ("run", cmd_run)]:
+                     ("design", cmd_design), ("request-approval", cmd_request_approval),
+                     ("report", cmd_report), ("run", cmd_run)]:
         p = sub.add_parser(name)
         p.add_argument("run_id", nargs="?", default=None)
         p.add_argument("--format", choices=["md", "json"], default="md")
         p.set_defaults(func=fn)
+    p = sub.add_parser("reply", help='apply an approval reply, e.g. reply "1 3"')
+    p.add_argument("text")
+    p.set_defaults(func=cmd_reply)
+    p = sub.add_parser("whatsapp", help="run the WhatsApp bridge (links a spare number on first run)")
+    p.add_argument("--pair-code", metavar="SPARE_NUMBER", default=None,
+                   help="link with a pairing code for this number instead of scanning a QR code")
+    p.set_defaults(func=cmd_whatsapp)
     args = parser.parse_args(argv)
 
     setup_logging(settings.log_dir, settings.log_level)
@@ -115,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
     except LLMError as exc:
         log.error("LLM unavailable: %s", exc)
         return 2
+    except WhatsAppError as exc:
+        log.error("WhatsApp error: %s", exc)
+        return 3
     except KeyboardInterrupt:
         return 130
     except Exception:

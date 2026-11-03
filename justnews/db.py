@@ -78,6 +78,32 @@ CREATE TABLE IF NOT EXISTS images (
     note          TEXT,               -- why this kind was chosen
     created_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL,
+    items         TEXT NOT NULL,      -- JSON {"1": article_id, ...}: the numbers shown to the owner
+    status        TEXT NOT NULL,      -- sent / answered / expired / superseded
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    reply         TEXT,
+    answered_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS wa_inbound (
+    message_id    TEXT PRIMARY KEY,   -- a message can arrive twice after a reconnect; handle it once
+    sender        TEXT NOT NULL,
+    body          TEXT,
+    received_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wa_outbox (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_number     TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    sent_at       TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    error         TEXT,              -- last failure; given up after the bridge's maximum attempts
+    media_path    TEXT               -- image to send, with `body` as its caption
+);
 CREATE TABLE IF NOT EXISTS llm_usage (
     run_id        TEXT NOT NULL,
     agent         TEXT NOT NULL,
@@ -102,13 +128,22 @@ def _now() -> str:
 class Database:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # The WhatsApp bridge reads and writes from its event, inbox and outbox threads.
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(runs)")}
         for column in ("content", "images"):  # added with agents 3 and 4
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
+        if "approval" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}:
+            # NULL (not asked) / requested / approved / rejected
+            self.conn.execute("ALTER TABLE posts ADD COLUMN approval TEXT")
+        if "media_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}:
+            self.conn.execute("ALTER TABLE wa_outbox ADD COLUMN media_path TEXT")
+        if "pending" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(approval_requests)")}:
+            # JSON list of story numbers awaiting the owner's "yes" (approvals given in free text)
+            self.conn.execute("ALTER TABLE approval_requests ADD COLUMN pending TEXT")
         self.conn.commit()
 
     @contextmanager
@@ -255,3 +290,76 @@ class Database:
                        creator, credit, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (article_id, run_id, image["kind"], image["path"], image.get("source_page"), image.get("license"),
                  image.get("license_url"), image.get("creator"), image.get("credit"), image.get("note"), _now()))
+
+    # --- WhatsApp approval ------------------------------------------------------
+    def create_approval_request(self, run_id: str, items: dict[str, str], expires_at: str, status: str) -> int:
+        with self.tx() as c:
+            c.execute("UPDATE approval_requests SET status = 'superseded' WHERE status IN ('awaiting_window', 'sent')")
+            cur = c.execute("INSERT INTO approval_requests(run_id, items, status, created_at, expires_at) "
+                            "VALUES (?, ?, ?, ?, ?)", (run_id, json.dumps(items), status, _now(), expires_at))
+            c.executemany("UPDATE posts SET approval = 'requested' WHERE article_id = ?", [(a,) for a in items.values()])
+            return cur.lastrowid
+
+    def open_approval_request(self) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM approval_requests WHERE status IN ('awaiting_window', 'sent') "
+                                 "ORDER BY id DESC LIMIT 1").fetchone()
+
+    def approval_request(self, request_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM approval_requests WHERE id = ?", (request_id,)).fetchone()
+
+    def latest_approval_request(self) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM approval_requests ORDER BY id DESC LIMIT 1").fetchone()
+
+    def set_approval_status(self, request_id: int, status: str, reply: str | None = None) -> None:
+        with self.tx() as c:
+            if reply is None:
+                c.execute("UPDATE approval_requests SET status = ? WHERE id = ?", (status, request_id))
+            else:
+                c.execute("UPDATE approval_requests SET status = ?, reply = ?, answered_at = ? WHERE id = ?",
+                          (status, reply, _now(), request_id))
+
+    def set_pending_approval(self, request_id: int, numbers: list[int] | None) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE approval_requests SET pending = ? WHERE id = ?",
+                      (json.dumps(numbers) if numbers is not None else None, request_id))
+
+    def set_post_approval(self, article_ids: list[str], approval: str) -> None:
+        with self.tx() as c:
+            c.executemany("UPDATE posts SET approval = ? WHERE article_id = ?", [(approval, a) for a in article_ids])
+
+    def posts_awaiting_approval(self, run_id: str, limit: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT p.*, a.source_name, a.url, a.category, e.overall FROM posts p
+               JOIN articles a ON a.id = p.article_id
+               LEFT JOIN evaluations e ON e.article_id = p.article_id AND e.run_id = p.run_id
+               WHERE p.run_id = ? AND p.approval IS NULL ORDER BY e.overall DESC LIMIT ?""",
+            (run_id, limit)).fetchall()
+
+    def record_inbound(self, message_id: str, sender: str, body: str) -> bool:
+        """Store an incoming message; False if it was already handled (redelivered after a reconnect)."""
+        with self.tx() as c:
+            cur = c.execute("INSERT OR IGNORE INTO wa_inbound VALUES (?, ?, ?, ?)", (message_id, sender, body, _now()))
+            return cur.rowcount == 1
+
+    # --- WhatsApp outbox (written by any command, sent by the bridge) -------------
+    def enqueue_message(self, to_number: str, body: str, media_path: str | None = None) -> int:
+        with self.tx() as c:
+            return c.execute("INSERT INTO wa_outbox(to_number, body, created_at, media_path) VALUES (?, ?, ?, ?)",
+                             (to_number, body, _now(), media_path)).lastrowid
+
+    def pending_messages(self, max_attempts: int = 5) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM wa_outbox WHERE sent_at IS NULL AND attempts < ? ORDER BY id",
+                                 (max_attempts,)).fetchall()
+
+    def mark_message_sent(self, message_id: int) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE wa_outbox SET sent_at = ?, error = NULL WHERE id = ?", (_now(), message_id))
+
+    def block_message(self, message_id: int, reason: str) -> None:
+        """Never send this message (e.g. addressed to someone other than the owner)."""
+        with self.tx() as c:
+            c.execute("UPDATE wa_outbox SET attempts = 999, error = ? WHERE id = ?", (reason, message_id))
+
+    def mark_message_failed(self, message_id: int, error: str, max_attempts: int) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE wa_outbox SET attempts = attempts + 1, error = ? WHERE id = ?", (error, message_id))

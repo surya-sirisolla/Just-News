@@ -38,7 +38,7 @@ def build_report(db: Database, run_id: str) -> dict:
             "headline": p["headline"], "caption": p["caption"], "hashtags": json.loads(p["hashtags"]),
             "attribution": p["attribution"], "image_text": p["image_text"], "status": p["status"],
             "review_note": p["review_note"], "category": p["category"], "article_title": p["title"],
-            "model": p["model"], "image": p["image_path"] and {
+            "model": p["model"], "approval": p["approval"] or "not requested", "image": p["image_path"] and {
                 "kind": p["image_kind"], "path": p["image_path"], "credit": p["image_credit"],
                 "license": p["image_license"], "source_page": p["image_source"], "note": p["image_note"]},
         }
@@ -130,6 +130,7 @@ def _posts_section(report: dict) -> list[str]:
             out += [f"![{p['image_text']}]({rel})", ""]
         out += [p["caption"], "", " ".join(p["hashtags"]), "", p["attribution"], "",
                 f"- Status: {status}" + (f" ({p['review_note']})" if p["review_note"] else ""),
+                f"- Approval: {p['approval']}",
                 f"- Image text: {p['image_text']}"]
         if p["image"]:
             img = p["image"]

@@ -105,5 +105,28 @@ class Settings:
     font_bold: str = field(default_factory=lambda: os.getenv("JUSTNEWS_FONT_BOLD", ""))
     font_regular: str = field(default_factory=lambda: os.getenv("JUSTNEWS_FONT_REGULAR", ""))
 
+    # WhatsApp approval through a linked spare number (see justnews/whatsapp.py). Approval is on
+    # when the owner number is set; otherwise `run` designs images for every draft as before.
+    # The owner is the only number allowed to approve: digits with country code, no "+".
+    whatsapp_owner: str = field(default_factory=lambda: os.getenv("WHATSAPP_OWNER_NUMBER", "").lstrip("+").replace(" ", ""))
+    whatsapp_session: Path = field(default_factory=lambda: Path(os.getenv(
+        "WHATSAPP_SESSION_PATH", PROJECT_ROOT / "data" / "whatsapp-session.sqlite3")))
+    approval_expiry_hours: float = field(default_factory=lambda: _float("JUSTNEWS_APPROVAL_EXPIRY_HOURS", 12.0))
+    # Free-tier Gemini models for chatting with the owner, fastest first (replies should feel instant).
+    gemini_chat_models: list[str] = field(default_factory=lambda: _list(
+        "GEMINI_CHAT_MODELS", ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"]))
+
+    @property
+    def whatsapp_enabled(self) -> bool:
+        return bool(self.whatsapp_owner)
+
+    @property
+    def whatsapp_heartbeat(self) -> Path:
+        return self.whatsapp_session.with_suffix(".heartbeat")
+
+    @property
+    def whatsapp_qr_png(self) -> Path:
+        return self.whatsapp_session.with_name("whatsapp-qr.png")
+
 
 settings = Settings()

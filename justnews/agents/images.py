@@ -94,11 +94,13 @@ class ImageDesignerAgent:
         self.chooser = chooser
 
     # --- public entry point -------------------------------------------------
-    def run(self, run_id: str) -> ImageResult:
+    def run(self, run_id: str, article_ids: list[str] | None = None) -> ImageResult:
+        """Design images for the run's posts that have none; only `article_ids` when given (approved posts)."""
         out_dir = self.settings.output_dir / run_id
         out_dir.mkdir(parents=True, exist_ok=True)
         result = ImageResult(run_id, output_dir=str(out_dir))
-        posts = [p for p in self.db.posts_for_run(run_id) if not p["image_path"]]
+        posts = [p for p in self.db.posts_for_run(run_id)
+                 if not p["image_path"] and (article_ids is None or p["article_id"] in article_ids)]
         log.info("Run %s: designing images for %d posts", run_id, len(posts))
         for i, p in enumerate(posts, 1):
             post = {"headline": p["headline"], "image_text": p["image_text"], "category": p["category"],

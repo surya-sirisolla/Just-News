@@ -2,8 +2,8 @@
 
 An agentic social media automation platform. Four independent agents, orchestrated by
 [PicoClaw](https://github.com/sipeed/picoclaw), find recent news, decide what is worth posting, and
-draft posts with images. Nothing is published, posted or sent: drafts are for human review.
-WhatsApp and social publishing are later phases.
+draft posts. The owner picks on WhatsApp which posts to make, and only those get an image.
+Instagram publishing is the next phase (see [Instagram auto-posting](#instagram-auto-posting-what-is-needed)).
 
 | Agent | Module | PicoClaw skill | LLM |
 |---|---|---|---|
@@ -36,7 +36,10 @@ PicoClaw agent (orchestrator LLM, reads AGENT.md + skills)
   │                                               Jev review: unsupported facts / sensational tone /
   │                                                 people or groups described differently → needs_review
   │                                               └─▶ SQLite: posts
-  │  exec ./bin/justnews design <run_id>     ─▶ Agent 4: one 1080×1080 PNG per post
+  │  exec ./bin/justnews request-approval    ─▶ WhatsApp: numbered shortlist (text only) to the owner
+  │                                               "1 3" / "all" / "none" ─▶ WhatsApp bridge ─▶ Agent 4
+  │                                               designs the chosen posts only, one text ack back
+  │  (Agent 4, on approval)                   ─▶ one 1080×1080 PNG per approved post
   │                                               photo suggested → Wikimedia Commons search, licence
   │                                                 filter, Jev picks best fit (or none) → overlay + credit
   │                                               otherwise / no good fit → white text graphic (Pillow)
@@ -87,6 +90,37 @@ poor fit for news anyway, so Agent 4 uses none:
   text graphic.
 - **Text** is drawn by code, so it is always spelled exactly as written.
 
+**WhatsApp approval.** This works the way OpenClaw does: a **spare WhatsApp number** is linked
+to the bridge once, as a linked device (scan a QR code). The bot then uses that number to message
+your own number, with no Meta account or API keys.
+- **The shortlist:** after Agent 3, you get a numbered list (headline, caption, hashtags, source
+  and link, plus any review flag) as plain text, never images.
+- **Replies:** you answer `1 3`, `1-3`, `all` or `none` (`list` shows it again). Only those posts
+  are designed and marked approved; the rest are marked rejected. One short text confirms it.
+- **Talking to it:** anything else goes to a Gemini free-tier model, which replies naturally and
+  in your language. For example:
+  - "send me the templates", "show me 3" or "send the iPhone one" sends those templates as images,
+    with caption, hashtags and source;
+  - "what's ready?" gets a status update;
+  - "go with the Apple story" makes it ask "yes?" before acting.
+  Code checks every number against the real list, so the bot can't claim something it didn't do.
+  Without Gemini, keyword rules handle the basics.
+- **Only you:** the bot reads only your direct chat with it (`WHATSAPP_OWNER_NUMBER`). It ignores
+  every other number, groups, broadcast lists, channels and Status updates (including yours),
+  without replying, reading or reacting. The bridge also refuses to send to any number but yours.
+  Repeats are ignored, a new shortlist replaces the previous one, and shortlists expire after 12
+  hours.
+- **How messages flow:** the bridge (`python -m justnews whatsapp`) is the only process connected
+  to WhatsApp. Other commands queue messages in SQLite (`wa_outbox`), and the bridge sends them,
+  so a cycle can run while the bridge is stopped and the shortlist goes out once it starts.
+- **Without `WHATSAPP_OWNER_NUMBER`,** the messages are printed instead, and
+  `python -m justnews reply "1 3"` applies your answer.
+
+> ⚠️ This uses the WhatsApp Web protocol (whatsmeow, via `neonize`), not an official API.
+> WhatsApp may restrict or ban numbers it flags, so use a spare number, message only yourself,
+> and keep volume low. The session file (`data/whatsapp-session.sqlite3`) gives full access to
+> that WhatsApp account: never commit or share it.
+
 **Duplicates** are caught at four levels:
 
 1. Same canonical URL within a run (discovery).
@@ -128,7 +162,10 @@ Individual agents and reports:
 .venv/bin/python -m justnews discover          # Agent 1, prints run_id + stats
 .venv/bin/python -m justnews evaluate RUN_ID   # Agent 2 (default: latest run)
 .venv/bin/python -m justnews create RUN_ID     # Agent 3: draft posts
-.venv/bin/python -m justnews design RUN_ID     # Agent 4: images in output/RUN_ID/
+.venv/bin/python -m justnews design RUN_ID     # Agent 4 for every draft (no approval step)
+.venv/bin/python -m justnews request-approval RUN_ID   # WhatsApp shortlist
+.venv/bin/python -m justnews reply "1 3"       # apply an approval from the terminal
+.venv/bin/python -m justnews whatsapp          # WhatsApp bridge (keep it running)
 .venv/bin/python -m justnews report RUN_ID --format json
 ```
 
@@ -152,6 +189,9 @@ justnews/
   agents/images.py      Agent 4 (Wikimedia Commons search, licence filter)
   graphics.py           Pillow layouts: white text graphic, photo with overlay
   jev.py                TypeSafe Jev: scoring, duplicate checks, post review, photo choice
+  approval.py           WhatsApp approval: shortlist, reply parsing, design on approval
+  assistant.py          natural-language replies on WhatsApp (Gemini free tier, keyword fallback)
+  whatsapp.py           linked-device WhatsApp bridge (QR link, outbox sender, owner filter)
   llm.py                Claude (Anthropic SDK) and Gemini clients, token/cost accounting
   db.py                 SQLite schema and queries
   report.py, cli.py, config.py, models.py, http.py, logging_setup.py
@@ -165,6 +205,79 @@ tests/                offline tests (fake model clients, no network)
 ```
 
 Secrets only ever live in `.env` and the generated `picoclaw/home/.security.yml`. Both are gitignored.
+
+## Where the templates are
+
+- **Files:** `output/<run_id>/NN-<headline>.png`, one 1080×1080 PNG per approved post. The newest
+  run is the newest folder.
+- **Report:** `reports/run-<run_id>.md` shows every draft with its image, caption, hashtags,
+  source, approval state and photo credit. Run `python -m justnews report` to regenerate it.
+- **WhatsApp:** ask the bot ("send me the templates", "send 2").
+
+## WhatsApp setup
+
+1. **Owner number:** in `.env`, set `WHATSAPP_OWNER_NUMBER` to **your own** number (country code,
+   no `+`).
+2. **libmagic:** install it once (`brew install libmagic` on macOS, `apt install libmagic1` on
+   Debian or Ubuntu).
+3. **Link the spare number:** run `.venv/bin/python -m justnews whatsapp`. On the **spare** phone,
+   open WhatsApp > Settings > Linked devices > Link a device, and scan the QR code from the
+   terminal (also saved as `data/whatsapp-qr.png`). Or use
+   `--pair-code <spare number>` and enter the 8-character code via "Link with phone number
+   instead".
+4. **Keep it running:** leave the bridge on. Later starts reconnect from the saved session, with
+   no new scan. Each news cycle's shortlist arrives on your phone from the spare number; reply
+   there.
+
+## Posting to Instagram and X: step by step
+
+Only posts you approved on WhatsApp will be published. Both platforms need their official APIs
+(neither offers a QR-style link for posting). Once the keys below are in `.env`, the publisher
+agent is the next piece to build.
+
+### Instagram (Instagram Graph API)
+
+1. **Professional account:** in the Instagram app for Just News, go to Settings > Account type and
+   tools > Switch to professional account, and choose Business or Creator.
+2. **Facebook Page:** link the account to a Facebook Page (Accounts Center, or the Page's settings
+   > Linked accounts). Meta's publishing guide expects this.
+3. **Meta app:** at developers.facebook.com > My Apps > Create app, pick the Instagram use case
+   (manage messaging and content) and a Business app type.
+4. **Connect the account:** in the app's Instagram > API setup with Instagram login, add your
+   Instagram account. If asked, add it under App roles > Instagram testers, and accept the invite
+   in Instagram (Settings > Website permissions > Apps and websites > Tester invites). The app can
+   stay in Development mode, because posting to your own account needs no App Review.
+5. **Permissions and token:** grant `instagram_business_basic` and
+   `instagram_business_content_publish`, then generate a long-lived token. It lasts about 60
+   days, and the publisher will refresh it.
+6. **`.env`:** set `INSTAGRAM_ACCESS_TOKEN` and `INSTAGRAM_USER_ID` (the IG user ID shown in API
+   setup).
+7. **Public image hosting:** Meta downloads each image from a public HTTPS URL. Create a public
+   bucket, for example on Cloudflare R2 (its free tier is plenty) or S3, and set
+   `MEDIA_PUBLIC_BASE_URL` and the bucket keys in `.env`.
+8. **What the publisher will do:** convert the PNG to JPEG (Instagram accepts only JPEG), upload
+   it, create the post with `POST /<IG_ID>/media` (`image_url`, caption and hashtags), then
+   publish it with `POST /<IG_ID>/media_publish`. Limits: 100 API posts per 24 hours, captions up
+   to 2,200 characters, at most 30 hashtags.
+
+### X / Twitter (X API v2)
+
+1. **Developer account:** sign in to console.x.com as the Just News X account, accept the
+   developer agreement, and create an app.
+2. **App permissions:** in User authentication settings, set the app permissions to **Read and
+   write**, with the type "Web App, Automated App or Bot". Any callback URL works, e.g.
+   `http://localhost`.
+3. **Keys and tokens:** generate the API key and secret, then the access token and secret for
+   your account. Generate the tokens *after* setting Read and write, or they stay read-only.
+4. **Credits:** X has no free posting tier. It's pay-per-use: about **$0.015 per post**, but
+   **$0.20 per post that contains a link**. Buy credits in the console, set a monthly spending
+   limit, and leave auto-recharge off at first.
+5. **`.env`:** set `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and `X_ACCESS_TOKEN_SECRET`.
+6. **What the publisher will do:** upload the image with `POST https://api.x.com/2/media/upload`
+   (`media_category=tweet_image`), then post with `POST https://api.x.com/2/tweets` (text plus
+   `media.media_ids`). The text must fit 280 characters (a link counts as 23), so X gets a
+   shorter version: the headline, 1–2 hashtags and "Source: BBC News". Leaving the URL out keeps
+   each post at $0.015.
 
 ## Scheduling (later)
 
