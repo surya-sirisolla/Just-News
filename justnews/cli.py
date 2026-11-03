@@ -198,9 +198,23 @@ def cmd_run(db: Database, args) -> str:
     return cmd_report(db, args)
 
 
+def seconds_until_due(db: Database, every_minutes: int) -> float:
+    """Time left until the next cycle, counted from the last one, so a restart or deploy doesn't
+    send an extra shortlist."""
+    last = db.latest_run_id()
+    if not last:
+        return 0.0
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(db.get_run(last)["started_at"])).total_seconds()
+    return max(0.0, every_minutes * 60 - elapsed)
+
+
 def scheduler(every_minutes: int, stop: threading.Event) -> None:
-    """Run a news cycle now and then every `every_minutes`, on its own database connection."""
+    """Run a news cycle every `every_minutes` (the first when one is due), on its own connection."""
     db = Database(settings.db_path)
+    wait = seconds_until_due(db, every_minutes)
+    if wait:
+        log.info("Next news cycle in %.0f minutes (the last one ran recently)", wait / 60)
+        stop.wait(wait)
     while not stop.is_set():
         started = time.monotonic()
         try:

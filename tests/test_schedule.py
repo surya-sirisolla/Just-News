@@ -40,9 +40,21 @@ class SchedulerTests(unittest.TestCase):
             return "run"
 
         with mock.patch.object(cli, "run_cycle", side_effect=cycle), \
-             mock.patch.object(cli, "Database"), mock.patch.object(stop, "wait", side_effect=lambda s: None):
+             mock.patch.object(cli, "Database"), mock.patch.object(cli, "seconds_until_due", return_value=0), \
+             mock.patch.object(stop, "wait", side_effect=lambda s: None):
             cli.scheduler(60, stop)
         self.assertEqual(len(calls), 3)
+
+    def test_restart_waits_for_the_next_due_time(self):
+        import tempfile
+        from pathlib import Path
+        from justnews.db import Database
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "t.db")
+            self.assertEqual(cli.seconds_until_due(db, 60), 0)  # never ran: run now
+            db.create_run("r1")  # a cycle just started
+            self.assertGreater(cli.seconds_until_due(db, 60), 59 * 60)
+            db.conn.close()
 
 
 if __name__ == "__main__":
