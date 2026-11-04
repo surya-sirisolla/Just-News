@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS articles (
     source_name   TEXT NOT NULL,
     feed          TEXT,
     category      TEXT NOT NULL,
+    region        TEXT,               -- South India / India / International
     published_at  TEXT,
     first_run_id  TEXT NOT NULL,
     last_run_id   TEXT NOT NULL,
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS images (
     creator       TEXT,
     credit        TEXT,               -- attribution line, also drawn on the image
     note          TEXT,               -- why this kind was chosen
+    photo_path    TEXT,               -- the licensed photo itself, for carousel slides
     created_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS approval_requests (
@@ -107,7 +109,7 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
 CREATE TABLE IF NOT EXISTS publications (
     article_id    TEXT NOT NULL REFERENCES posts(article_id),
     platform      TEXT NOT NULL,      -- "instagram" or "x"
-    status        TEXT NOT NULL,      -- published / failed (retried) / blocked (account problem: not retried)
+    status        TEXT NOT NULL,      -- queued / published / failed (retried) / blocked (account problem: not retried)
     media_id      TEXT,
     permalink     TEXT,
     error         TEXT,
@@ -198,14 +200,22 @@ class Database:
         if "approval" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}:
             # NULL (not asked) / requested / approved / rejected
             self.conn.execute("ALTER TABLE posts ADD COLUMN approval TEXT")
+        if "region" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(articles)")}:
+            self.conn.execute("ALTER TABLE articles ADD COLUMN region TEXT")
         post_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}
-        for column in ("ig_caption", "x_post"):  # platform versions, added with the strategist
+        for column in ("ig_caption", "x_post", "x_hashtag"):  # platform versions
             if column not in post_columns:
                 self.conn.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
         if "media_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}:
             self.conn.execute("ALTER TABLE wa_outbox ADD COLUMN media_path TEXT")
-        if "attempts" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(publications)")}:
+        pub_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(publications)")}
+        if "attempts" not in pub_columns:
             self.conn.execute("ALTER TABLE publications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
+        for column in ("scheduled_at", "batch"):  # the X queue: when to post, and which approval it belongs to
+            if column not in pub_columns:
+                self.conn.execute(f"ALTER TABLE publications ADD COLUMN {column} TEXT")
+        if "photo_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(images)")}:
+            self.conn.execute("ALTER TABLE images ADD COLUMN photo_path TEXT")
         if "pending" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(approval_requests)")}:
             # JSON list of story numbers awaiting the owner's "yes" (approvals given in free text)
             self.conn.execute("ALTER TABLE approval_requests ADD COLUMN pending TEXT")
@@ -251,11 +261,12 @@ class Database:
             for a in articles:
                 c.execute(
                     """INSERT INTO articles(id, title, title_norm, description, url, source_name, feed, category,
-                                            published_at, first_run_id, last_run_id, first_seen_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(id) DO UPDATE SET last_run_id = excluded.last_run_id""",
+                                            published_at, first_run_id, last_run_id, first_seen_at, region)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET last_run_id = excluded.last_run_id,
+                                                     region = COALESCE(articles.region, excluded.region)""",
                     (a.id, a.title, normalize_title(a.title), a.description, a.url, a.source_name, a.feed,
-                     a.category, _iso(a.published_at), run_id, run_id, now),
+                     a.category, _iso(a.published_at), run_id, run_id, now, a.region or None),
                 )
 
     def articles_for_run(self, run_id: str) -> list[Article]:
@@ -264,7 +275,7 @@ class Database:
         return [
             Article(id=r["id"], title=r["title"], url=r["url"], source_name=r["source_name"], category=r["category"],
                     published_at=datetime.fromisoformat(r["published_at"]) if r["published_at"] else None,
-                    description=r["description"] or "", feed=r["feed"] or "")
+                    description=r["description"] or "", feed=r["feed"] or "", region=r["region"] or "")
             for r in rows
         ]
 
@@ -332,16 +343,18 @@ class Database:
         with self.tx() as c:
             c.execute(
                 """INSERT OR REPLACE INTO posts(article_id, run_id, headline, caption, hashtags, attribution,
-                       image_text, visual, image_query, status, review_note, model, created_at, ig_caption, x_post)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       image_text, visual, image_query, status, review_note, model, created_at, ig_caption, x_post,
+                       x_hashtag)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (article_id, run_id, post["headline"], post["caption"], json.dumps(post["hashtags"]),
                  post["attribution"], post["image_text"], post["visual"], post.get("image_query"),
-                 post["status"], post.get("review_note"), model, _now(), post.get("ig_caption"), post.get("x_post")))
+                 post["status"], post.get("review_note"), model, _now(), post.get("ig_caption"), post.get("x_post"),
+                 post.get("x_hashtag")))
 
     def posts_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             """SELECT p.*, a.title, a.url, a.source_name, a.category, a.published_at, e.overall,
-                      i.kind AS image_kind, i.path AS image_path, i.credit AS image_credit,
+                      i.kind AS image_kind, i.path AS image_path, i.credit AS image_credit, i.photo_path,
                       i.license AS image_license, i.source_page AS image_source, i.note AS image_note
                FROM posts p JOIN articles a ON a.id = p.article_id
                LEFT JOIN evaluations e ON e.article_id = p.article_id AND e.run_id = p.run_id
@@ -353,9 +366,10 @@ class Database:
         with self.tx() as c:
             c.execute(
                 """INSERT OR REPLACE INTO images(article_id, run_id, kind, path, source_page, license, license_url,
-                       creator, credit, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       creator, credit, note, created_at, photo_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (article_id, run_id, image["kind"], image["path"], image.get("source_page"), image.get("license"),
-                 image.get("license_url"), image.get("creator"), image.get("credit"), image.get("note"), _now()))
+                 image.get("license_url"), image.get("creator"), image.get("credit"), image.get("note"), _now(),
+                 image.get("photo_path")))
 
     # --- WhatsApp approval ------------------------------------------------------
     def create_approval_request(self, run_id: str, items: dict[str, str], expires_at: str, status: str) -> int:
@@ -392,6 +406,20 @@ class Database:
     def set_post_approval(self, article_ids: list[str], approval: str) -> None:
         with self.tx() as c:
             c.executemany("UPDATE posts SET approval = ? WHERE article_id = ?", [(approval, a) for a in article_ids])
+
+    def reject(self, run_id: str, article_id: str, reason: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE evaluations SET decision = 'Rejected', reason = ? WHERE run_id = ? AND article_id = ?",
+                      (reason, run_id, article_id))
+
+    def adopt_posts(self, run_id: str, article_ids: list[str]) -> int:
+        """Move unpublished posts written in earlier runs into `run_id` (on-demand research), so a
+        story offered before can be offered again without writing it twice."""
+        with self.tx() as c:
+            return c.executemany(
+                """UPDATE posts SET run_id = ?, approval = NULL WHERE article_id = ? AND article_id NOT IN
+                   (SELECT article_id FROM publications WHERE status IN ('published', 'queued'))""",
+                [(run_id, a) for a in article_ids]).rowcount
 
     def posts_awaiting_approval(self, run_id: str, limit: int) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -439,10 +467,42 @@ class Database:
                          permalink: str | None = None, error: str | None = None) -> None:
         previous = self.publication(article_id, platform)
         attempts = (previous["attempts"] + 1) if previous is not None and status == "failed" else 1
+        # A queued post keeps its batch and slot, so the owner's summary lists it in order.
+        batch, slot = (previous["batch"], previous["scheduled_at"]) if previous is not None else (None, None)
         with self.tx() as c:
             c.execute("INSERT OR REPLACE INTO publications(article_id, platform, status, media_id, permalink, error, "
-                      "updated_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (article_id, platform, status, media_id, permalink, error, _now(), attempts))
+                      "updated_at, attempts, batch, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (article_id, platform, status, media_id, permalink, error, _now(), attempts, batch, slot))
+
+    # --- the X queue: posts spaced out over time ----------------------------------
+    def queue_publication(self, article_id: str, platform: str, scheduled_at: str, batch: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT OR REPLACE INTO publications(article_id, platform, status, updated_at, attempts, "
+                      "scheduled_at, batch) VALUES (?, ?, 'queued', ?, 1, ?, ?)",
+                      (article_id, platform, _now(), scheduled_at, batch))
+
+    def queued_publications(self, platform: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT pub.article_id, pub.scheduled_at, pub.batch, p.run_id FROM publications pub
+               JOIN posts p ON p.article_id = pub.article_id
+               WHERE pub.platform = ? AND pub.status = 'queued' ORDER BY pub.scheduled_at""", (platform,)).fetchall()
+
+    def batch_publications(self, platform: str, batch: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM publications WHERE platform = ? AND batch = ? "
+                                 "ORDER BY scheduled_at, rowid", (platform, batch)).fetchall()
+
+    def published_between(self, start: str, end: str) -> list[sqlite3.Row]:
+        """Stories published (on any platform) between two UTC times, once each, in posting order."""
+        return self.conn.execute(
+            """SELECT p.*, a.title, a.url, a.source_name, a.category, a.published_at, a.region,
+                      i.kind AS image_kind, i.path AS image_path, i.credit AS image_credit, i.photo_path,
+                      MIN(pub.updated_at) AS posted_at, MIN(pub.rowid) AS posted_seq,
+                      (SELECT MAX(e.overall) FROM evaluations e WHERE e.article_id = p.article_id) AS overall
+               FROM publications pub JOIN posts p ON p.article_id = pub.article_id
+               JOIN articles a ON a.id = p.article_id
+               LEFT JOIN images i ON i.article_id = p.article_id
+               WHERE pub.status = 'published' AND pub.updated_at >= ? AND pub.updated_at < ?
+               GROUP BY p.article_id ORDER BY posted_at, posted_seq""", (start, end)).fetchall()
 
     def post_headline(self, article_id: str) -> str | None:
         row = self.conn.execute("SELECT headline FROM posts WHERE article_id = ?", (article_id,)).fetchone()

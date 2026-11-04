@@ -255,12 +255,21 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
    rule that expires `posts/` after 7 days, and an IAM user (or, on AWS, a role) allowed
    `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject` on `arn:aws:s3:::BUCKET/posts/*`.
    Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `JUSTNEWS_S3_BUCKET`.
-4. **How each post goes out:** the PNG becomes a JPEG, is uploaded to S3 and gets a 1-hour
-   presigned link. Then `POST /<IG_ID>/media` creates the post, the publisher waits for
-   `FINISHED`, and `POST /<IG_ID>/media_publish` publishes it. The permalink is saved and the S3
-   copy deleted.
-5. **Safeguards:** each story is posted once, at most `JUSTNEWS_MAX_POSTS_PER_DAY` (20) per day
-   (Instagram allows 100). The caption includes the photo credit for licensed photos.
+4. **Stories approved together become one carousel** (`justnews/carousel.py`, 1080×1350
+   slides): a cover ("BREAKING NEWS" only when the lead story is under an hour old, otherwise
+   "LATEST"; the first story with a licensed photo leads), one slide per story (photo with credit,
+   or the story's short text on its category colour; headline, facts, source, "2/5"), and a
+   closing "Follow @handle" slide. Instagram allows 10 slides, so up to 8 stories per carousel;
+   more are split evenly (10 → 5 + 5). A story approved alone is a single image post.
+   `JUSTNEWS_INSTAGRAM_CAROUSEL=false` posts every story on its own instead.
+5. **How each post goes out:** each image becomes a JPEG, is uploaded to S3 and gets a 1-hour
+   presigned link. `POST /<IG_ID>/media` creates a container per slide (`is_carousel_item`), then
+   one with `media_type=CAROUSEL`, the children and the caption (numbered headlines, shared
+   hashtags, sources, photo credits). The publisher waits for `FINISHED`, then
+   `POST /<IG_ID>/media_publish`. The permalink is saved and the S3 copies deleted.
+6. **Safeguards:** each story is posted once; a carousel counts as one of the
+   `JUSTNEWS_MAX_POSTS_PER_DAY` (20) posts (Instagram allows 100). Music, which puts a carousel in
+   the Reels tab, can't be added through the API: add it in the Instagram app if you want it.
 
 ### X / Twitter (built: `justnews/agents/x_publisher.py`)
 
@@ -288,13 +297,61 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
 6. **How each post goes out:** the JPEG is uploaded with `POST https://api.x.com/2/media/upload`
    (`media_category=tweet_image`), then posted with `POST https://api.x.com/2/tweets` (text plus
    `media.media_ids`). Requests are signed with OAuth 1.0a (HMAC-SHA1).
-7. **The text:** headline, caption, up to three hashtags and "Source: BBC News" (plus the photo
-   credit for licensed photos), within 280 characters as X counts them. When it's too long, the
-   caption is dropped first, then hashtags. Links and bare domains ("Reuters.com") are removed,
-   which keeps each post at $0.015.
+7. **The text, like a newspaper's feed (The Hindu on X):** one or two plain sentences that report
+   the news, ending "The Guardian reports." for the outlet's own reporting (or "Source: …" below),
+   plus the photo credit for licensed photos, within 280 characters as X counts them. No emoji,
+   flags or "BREAKING"; a hashtag only when the story belongs to a widely followed event
+   (#USMidterms), most posts have none. Links and bare domains ("Reuters.com") are removed, which
+   keeps each post at $0.015.
+   **One post per story, spaced out:** approved stories are queued one every
+   `JUSTNEWS_X_SPACING_MINUTES` (5), and `serve` posts each when it's due. WhatsApp says when
+   they'll go out, then sends the links when the batch is done. Anything still queued after
+   `JUSTNEWS_X_QUEUE_MAX_HOURS` (3) is dropped instead of posted stale.
 8. **Safeguards:** the same as Instagram: each story is posted once, at most
    `JUSTNEWS_MAX_POSTS_PER_DAY` per day, and a timed-out post is looked up on the account before
    any retry. X also refuses identical text, which the publisher treats as "already posted".
+
+## What news is picked: India first
+
+Most stories come from Indian outlets: The Hindu (national and the five southern states),
+The Indian Express, NDTV, The Times of India, Hindustan Times, Mint, The Economic Times, Deccan
+Chronicle and Google News India, including searches for the southern states and cities. A few
+world feeds (BBC, Al Jazeera, TechCrunch, The Verge) supply international news.
+- **Region per story** (`justnews/regions.py`): South Indian states, cities, parties and leaders
+  make a story *South India*; the rest of India makes it *India*; otherwise the source decides
+  (Indian national and state feeds: India; tech, AI and world feeds: only what the text says).
+- **Scoring for Indian readers:** Jev's relevance and interest questions ask about readers in
+  India, especially South India.
+- **The mix of each shortlist:** world news takes at most 20% of the list
+  (`JUSTNEWS_INTERNATIONAL_SHARE`) and only when it scores 85 or more
+  (`JUSTNEWS_INTERNATIONAL_MIN_SCORE`): important news only. Up to 40% is kept for South India
+  (`JUSTNEWS_SOUTH_INDIA_SHARE`); India and South India fill the rest, best first.
+
+## The daily recap Reel (9:30 PM IST)
+
+Every evening at `JUSTNEWS_RECAP_TIME` (21:30, owner's time zone), `serve` turns the stories posted
+that day (on Instagram or X, each once; the best `JUSTNEWS_RECAP_MAX_STORIES`, 10, in posting order)
+into one vertical video (`justnews/recap.py`, 1080×1920, about 3.5 s per story) and posts it to
+Instagram as a Reel, then sends the link on WhatsApp.
+- **The video:** a "TODAY'S NEWS" card with the date, one card per story (licensed photo with a
+  slow zoom and its credit, or the story's short text on its category colour; headline, one fact,
+  source; progress bars at the top), and a "Follow @handle" card. No models are involved: Pillow
+  draws, the ffmpeg bundled with `imageio-ffmpeg` encodes. The audio track is silent: Instagram's
+  API can't add music from its library.
+- **Once a day:** the result is saved in `agent_state`, so restarts don't post twice; after a
+  restart it still runs until quiet hours start (11 PM). A day with fewer than two stories is
+  skipped. A failure is retried twice more, then you get a WhatsApp message.
+- **By hand:** `python -m justnews recap --dry-run` makes the video without posting;
+  `python -m justnews recap` posts it (once per day).
+
+## Research on request
+
+Ask the bot on WhatsApp, e.g. "research on AQI today", "any news on Chennai rains?" or "find
+the latest on ISRO this week". It answers at once, then in the background searches Google News
+(India edition, the past day; "yesterday" two days, "this week" seven), scores the results with
+Jev (a lower bar, 55, and stories seen in earlier cycles count too), writes posts for the best five
+and sends them as a numbered "🔎 AQI" list. Reply with numbers to post them, as with any list.
+`python -m justnews research "AQI today"` does the same from the command line.
 
 ## Engagement strategist and the agents' discussion
 

@@ -13,7 +13,7 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # refuse decompression bombs from downloade
 
 CATEGORY_COLORS = {
     "Technology": (37, 99, 235), "AI": (124, 58, 237), "Business": (5, 150, 105),
-    "Politics": (220, 38, 38), "World": (217, 119, 6),
+    "Politics": (220, 38, 38), "World": (217, 119, 6), "India": (190, 18, 60), "South India": (13, 148, 136),
 }
 DEFAULT_COLOR = (17, 24, 39)
 INK = (17, 24, 39)
@@ -45,9 +45,16 @@ class Fonts:
         return ImageFont.truetype(path, size) if path else ImageFont.load_default(size)
 
 
+def drawable(text: str, font) -> str:
+    """The rupee sign as "Rs " when the font has no glyph for it (it would print as a box)."""
+    if "₹" in text and font.getmask("₹").getbbox() == font.getmask(chr(0xE0001)).getbbox():
+        return text.replace("₹", "Rs ").replace("Rs  ", "Rs ")
+    return text
+
+
 def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
     lines, line = [], ""
-    for word in text.split():
+    for word in drawable(text, font).split():
         trial = f"{line} {word}".strip()
         if draw.textlength(trial, font=font) <= max_width or not line:
             line = trial

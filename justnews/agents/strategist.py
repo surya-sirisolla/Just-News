@@ -39,7 +39,7 @@ CHECKPOINTS = {"instagram": (3, 24, 72), "x": (6, 48)}
 PLAYBOOK_MIN_HOURS, PLAYBOOK_MAX_HOURS = 6, 24  # refresh on new evidence, but not more often than this
 BENCHMARK_RETRY_HOURS = 6                       # after a failed benchmark read
 HOOK_MAX = 125      # Instagram cuts captions in the feed after about this many characters
-X_POST_MAX = 220    # leaves room for the source and hashtags in 280
+X_POST_MAX = 245    # leaves room for the source line in 280
 MAX_RULES, RULE_MAX = 7, 220
 
 # Starting rules, from research on what 2026 feed ranking rewards (sources in the README): on
@@ -60,13 +60,13 @@ BASE_PLAYBOOK = {
         "No emoji.",
     ],
     "x": [
-        "One or two lines that lead with the news itself, like a wire alert: who did what.",
-        "Put the number or the concrete detail up front when the source has one.",
-        "Start with the country's flag emoji when the story is mainly about one country.",
-        "Begin with 'JUST IN:' only when the article is marked fresh.",
-        "Don't start or end with the publisher's name: the 'Source:' line is added below. When it is a claim, "
-        "name who made it.",
-        "No question and no call to action; it must read differently from the Instagram caption.",
+        "Write it like a newspaper's feed on X (The Hindu): one or two plain sentences that report the news "
+        "like a lede: who did what, where, and when if the source says.",
+        "Use the specific names and numbers the source gives.",
+        "No emoji, flags, labels ('BREAKING', 'JUST IN'), questions or calls to action.",
+        "Don't start with 'According to': state the news, name who made a claim ('Iran says ...'), and end with "
+        "'<publisher> reports.' for the publisher's own reporting or forecasts.",
+        "Word it differently from the Instagram caption.",
     ],
     "observations": [],
     "experiments": [],
@@ -167,9 +167,9 @@ def code_notes(draft: dict, publisher: str = "") -> list[str]:
         notes.append("X: the x_post is missing.")
     else:
         if len(x) > X_POST_MAX:
-            notes.append(f"X: {len(x)} characters; keep it under 200.")
-        if publisher and publisher.lower() in x.lower():
-            notes.append(f"X: drop '{publisher}': the Source line is added below.")
+            notes.append(f"X: {len(x)} characters; keep it under 240.")
+        if re.match(r"\s*according to\b", x, re.I):
+            notes.append("X: don't open with 'According to'; state the news and end with '<publisher> reports.'")
         if ig and difflib.SequenceMatcher(None, x.lower(), ig.split("\n", 1)[0].lower()).ratio() > 0.8:
             notes.append("X: it repeats the Instagram hook; write it as a short wire-style alert instead.")
     return notes

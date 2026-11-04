@@ -83,10 +83,11 @@ SAME_EVENT_LEVELS = [
 
 ARTICLE_QUESTIONS = {
     "relevance": Score(
-        instructions="How newsworthy and important is the article in `article`?",
+        instructions="How newsworthy and important is the article in `article` for readers in India?",
         criteria=[d for d, _ in RELEVANCE_LEVELS]),
     "audience_interest": Score(
-        instructions="How interested would a broad, international social media audience be in the article in `article`?",
+        instructions="How interested would a broad social media audience in India, especially South India, be in "
+                     "the article in `article`?",
         criteria=[d for d, _ in INTEREST_LEVELS]),
     "is_news_event": Noul(
         instructions="Does the article in `article` report a specific new event, announcement or development?"),
@@ -173,6 +174,24 @@ class JevScorer:
     def _map(self, fn, items):
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             return list(pool.map(fn, items))
+
+    # --- on-demand research: is it about what the owner asked? ----------------------------
+    def about_topic(self, articles: list[Article], topic: str) -> dict[str, float]:
+        """P(the article is mainly about `topic`) by article ID; failed requests are left out."""
+        question = {"about": Noul(instructions=f"Is the article in `article` mainly about this topic: {topic}?")}
+
+        def one(a: Article):
+            try:
+                return a.id, self._ask(_article_state(a), question).answers["about"].noul
+            except LLMError as exc:
+                if not exc.fatal:
+                    log.warning("  Jev topic check failed for %s: %s", a.title[:60], exc)
+                return a.id, None
+
+        found = {aid: p for aid, p in self._map(one, articles) if p is not None}
+        if self._fatal:
+            raise self._fatal
+        return found
 
     # --- per-article scoring ----------------------------------------------------
     def score_articles(self, keys: dict[str, Article], known_credibility) -> dict[str, dict]:

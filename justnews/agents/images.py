@@ -134,7 +134,9 @@ class ImageDesignerAgent:
             if found:
                 photo, meta = found
                 render_photo(photo, post, meta["credit"], size, self.fonts, brand).save(path, optimize=True)
-                return {"kind": "photo", "path": str(path), "note": note, **meta}
+                photo_path = path.with_name(path.stem + "-photo.jpg")  # the photo alone, for carousel slides
+                photo.convert("RGB").save(photo_path, quality=90)
+                return {"kind": "photo", "path": str(path), "note": note, "photo_path": str(photo_path), **meta}
         render_graphic(post, size, self.fonts, brand).save(path, optimize=True)
         return {"kind": "graphic", "path": str(path), "note": note}
 

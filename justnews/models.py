@@ -54,6 +54,7 @@ class Article:
     description: str = ""
     feed: str = ""
     id: str = field(default="")
+    region: str = ""  # "South India", "India" or "International" (regions.py)
 
     def __post_init__(self) -> None:
         if not self.id:

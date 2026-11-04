@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-CATEGORIES = ["Technology", "AI", "Business", "Politics", "World"]
+CATEGORIES = ["India", "South India", "Business", "Technology", "AI", "World"]
 
 
 def _int(name: str, default: int) -> int:
@@ -88,6 +88,13 @@ class Settings:
     # Minimum gap between Gemini requests, to stay under free-tier requests-per-minute limits.
     gemini_min_interval: float = field(default_factory=lambda: _float("GEMINI_MIN_INTERVAL_SECONDS", 6.0))
     max_posts_per_run: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_RUN", 10))
+    # The shortlist's mix (regions.py): mostly India and South India; world news only when important.
+    international_share: float = field(default_factory=lambda: _float("JUSTNEWS_INTERNATIONAL_SHARE", 0.2))
+    international_min_score: int = field(default_factory=lambda: _int("JUSTNEWS_INTERNATIONAL_MIN_SCORE", 85))
+    south_india_share: float = field(default_factory=lambda: _float("JUSTNEWS_SOUTH_INDIA_SHARE", 0.4))
+    # On-demand research from WhatsApp ("research on AQI today"): a lower bar, a short list.
+    research_threshold: int = field(default_factory=lambda: _int("JUSTNEWS_RESEARCH_THRESHOLD", 55))
+    research_max_posts: int = field(default_factory=lambda: _int("JUSTNEWS_RESEARCH_MAX_POSTS", 5))
     # Total seconds the content creator may spend across models, so a cycle always finishes.
     gemini_content_time_budget: float = field(default_factory=lambda: _float("GEMINI_CONTENT_TIME_BUDGET", 150.0))
 
@@ -128,8 +135,17 @@ class Settings:
     instagram_api_version: str = field(default_factory=lambda: os.getenv("INSTAGRAM_API_VERSION", "v23.0"))
     s3_bucket: str = field(default_factory=lambda: os.getenv("JUSTNEWS_S3_BUCKET", "").strip())
     aws_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "ap-south-1"))
-    # Our own cap, well under Instagram's 100 API posts per 24 hours.
+    # Our own cap, well under Instagram's 100 API posts per 24 hours. A carousel counts as one post.
     max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 20))
+    # Two or more approved stories go to Instagram as one swipeable carousel (cover, a slide per story, close).
+    instagram_carousel: bool = field(default_factory=lambda: os.getenv("JUSTNEWS_INSTAGRAM_CAROUSEL", "true").lower() == "true")
+    # X gets one post per story, spaced out like a newsroom feed; posts still waiting after
+    # JUSTNEWS_X_QUEUE_MAX_HOURS are dropped rather than posted stale.
+    x_spacing_minutes: float = field(default_factory=lambda: _float("JUSTNEWS_X_SPACING_MINUTES", 5))
+    x_queue_max_hours: float = field(default_factory=lambda: _float("JUSTNEWS_X_QUEUE_MAX_HOURS", 3))
+    # Every day at this local time, a Reel recaps the stories posted that day ("off" disables).
+    recap_time: str = field(default_factory=lambda: os.getenv("JUSTNEWS_RECAP_TIME", "21:30"))
+    recap_max_stories: int = field(default_factory=lambda: _int("JUSTNEWS_RECAP_MAX_STORIES", 10))
 
     # X (API v2) with OAuth 1.0a keys for the posting account itself. Posting needs Pay-Per-Use
     # credits on console.x.com. Publishing is on when all four are set.

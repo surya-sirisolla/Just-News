@@ -22,9 +22,13 @@ import json
 import logging
 import sys
 import threading
+import re
 import time
 import uuid
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .agents.content import ContentCreatorAgent
 from .agents.discovery import NewsDiscoveryAgent
@@ -32,16 +36,20 @@ from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
 from .agents.publisher import InstagramPublisher, Publisher
 from .agents.strategist import StrategistAgent
-from .quiet import local_time, quiet_until
 from .agents.x_publisher import XPublisher
 from .approval import ApprovalService
-from .assistant import Assistant
+from .assistant import Assistant, clean_query
 from .whatsapp import Incoming, OutboxClient, WhatsAppBridge, WhatsAppError, bridge_running
 from .config import settings
 from .db import Database
+from .graphics import Fonts
 from .llm import GeminiClient, LLMError
 from .logging_setup import setup_logging
+from . import recap
+from .agents.publisher import merge_hashtags
+from .quiet import local_time, quiet_until
 from .report import REPORTS_DIR, build_report, render
+from .sources import GN_INDIA, Source, google_search
 
 log = logging.getLogger("justnews")
 
@@ -122,13 +130,14 @@ class ConsoleClient:
         return f"console-{uuid.uuid4().hex[:12]}"
 
 
-def make_publishers(db: Database) -> list[Publisher]:
-    """Every platform whose keys are set, in the order posts go out."""
+def make_publishers(db: Database, immediate: bool = False) -> list[Publisher]:
+    """Every platform whose keys are set, in the order posts go out. X queues its posts (spaced out)
+    unless `immediate`."""
     publishers: list[Publisher] = []
     if settings.instagram_enabled:
         publishers.append(InstagramPublisher(settings, db))
     if settings.x_enabled:
-        publishers.append(XPublisher(settings, db))
+        publishers.append(XPublisher(settings, db, spacing=0 if immediate else None))
     return publishers
 
 
@@ -143,10 +152,85 @@ def approval_service(db: Database) -> ApprovalService:
                                             timeout=20, retries=0) for m in settings.gemini_chat_models])
     publishers = {p.label: (lambda run_id, ids, p=p: p.publish(run_id, ids)) for p in make_publishers(db)}
     if settings.whatsapp_enabled:
-        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publishers=publishers)
+        return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publishers=publishers,
+                               researcher=start_research)
     log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
     return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant,
-                           publishers=publishers)
+                           publishers=publishers, researcher=lambda query, text: research_job(query, text, db))
+
+
+def research_window(text: str) -> str:
+    """How far back to search: "this week" -> 7 days, "yesterday" -> 2 days, otherwise 1 day."""
+    if re.search(r"\b(week|7 days|few days)\b", text, re.I):
+        return "7d"
+    return "2d" if re.search(r"\byesterday\b", text, re.I) else "1d"
+
+
+def research(db: Database, query: str, window: str = "1d") -> str:
+    """On-demand research: Google News (India edition) for the query, scored with a fresh look,
+    then posts for the best few. Returns the run ID; the stories wait for approval as usual."""
+    run_id = f"{new_run_id()}-research"
+    sources = [Source("Google News", google_search(query, window, GN_INDIA), "India", kind="google_news", region="India")]
+    hours = int(window.rstrip("d")) * 24 + 12  # the age limit follows the search window
+    NewsDiscoveryAgent(replace(settings, max_per_category=20, max_age_hours=max(settings.max_age_hours, hours)),
+                       db).run(run_id, sources=sources, include_seen=True)
+    NewsEvaluatorAgent(replace(settings, recommend_threshold=settings.research_threshold), db).run(run_id, fresh_look=True)
+    picked = [r["article_id"] for r in db.evaluations_for_run(run_id) if r["decision"] == "Recommended"]
+    picked = on_topic(db, run_id, picked, query)
+    db.adopt_posts(run_id, picked)  # stories written before (e.g. in a skipped list) are offered again
+    ContentCreatorAgent(settings, db).run(run_id, limit=settings.research_max_posts, mix=False)
+    return run_id
+
+
+TOPIC_PROBABILITY = 0.5
+SYNONYMS = {"aqi": ["aqi", "air quality", "air pollution", "pollution", "smog"],
+            "rain": ["rain", "rains", "rainfall", "flood", "floods", "monsoon"]}
+
+
+def on_topic(db: Database, run_id: str, article_ids: list[str], query: str) -> list[str]:
+    """Keep only the stories about what the owner asked: Jev decides when its key is set, otherwise
+    every word of the query (or a synonym) must appear in the headline or summary."""
+    articles = {a.id: a for a in db.articles_for_run(run_id) if a.id in article_ids}
+    if settings.typesafe_api_key:
+        from .jev import JevScorer
+        probs = JevScorer(settings.typesafe_api_key, "jev-1.14.0", 0.042).about_topic(list(articles.values()), query)
+        keep = {aid for aid, p in probs.items() if p >= TOPIC_PROBABILITY}
+    else:
+        words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 2]
+        keep = {aid for aid, a in articles.items()
+                if all(any(s in f"{a.title} {a.description}".lower() for s in SYNONYMS.get(w, [w])) for w in words)}
+    for aid in set(articles) - keep:
+        db.reject(run_id, aid, f"Not about {query}")
+    log.info("Research %s: %d of %d recommended stories are about %r", run_id, len(keep), len(articles), query)
+    return [aid for aid in article_ids if aid in keep]
+
+
+def research_job(query: str, text: str, db: Database | None = None) -> dict:
+    """Search, then send the shortlist (or say nothing was found) to the owner."""
+    db = db or Database(settings.db_path)  # a background thread uses its own connection
+    service = approval_service(db)
+    try:
+        run_id = research(db, query, research_window(text))
+        topic = query.upper() if query.isalpha() and len(query) <= 4 else query[:1].upper() + query[1:]  # "AQI"
+        result = service.request(run_id, title=f"🔎 *{topic}*", limit=settings.research_max_posts)
+        if not result.get("requested"):
+            service.client.send_text(service.owner, f"I couldn't find recent news worth posting on {query}. "
+                                                    "Try other words, or ask about the past week.")
+        return result
+    except Exception as exc:
+        log.exception("Research on %r failed", query)
+        service.client.send_text(service.owner, f"Sorry, the search on {query} failed ({type(exc).__name__}).")
+        return {"error": str(exc)}
+
+
+def start_research(query: str, text: str) -> None:
+    """Runs in the background, so the WhatsApp bot keeps answering while it searches."""
+    threading.Thread(target=research_job, args=(query, text), name="research", daemon=True).start()
+
+
+def cmd_research(db: Database, args) -> str:
+    print(json.dumps(research_job(clean_query(args.topic), args.topic, db), indent=2))
+    return ""
 
 
 def cmd_request_approval(db: Database, args) -> str:
@@ -184,7 +268,7 @@ def cmd_whatsapp(db: Database, args) -> str:
 
 def cmd_publish(db: Database, args) -> str:
     """Post a run's approved templates that aren't on Instagram/X yet (approvals normally do this)."""
-    publishers = make_publishers(db)
+    publishers = make_publishers(db, immediate=True)  # a manual run posts to X now, not queued
     if not publishers:
         raise SystemExit("Set the Instagram (INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_USER_ID, JUSTNEWS_S3_BUCKET) "
                          "or X (X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET) keys in .env first.")
@@ -224,6 +308,112 @@ def retry_failed_posts(db: Database) -> None:
             OutboxClient(db).send_text(settings.whatsapp_owner,
                                        f"Update: {n} approved stor{'ies' if n != 1 else 'y'} that failed earlier "
                                        f"{'are' if n != 1 else 'is'} now on {publisher.label} ✅\n{lines}")
+
+
+def batch_message(db: Database, label: str, result) -> str:
+    n, total = len(result.posted), len(result.posted) + len(result.failed)
+    text = f"{label}: {n} of {total} {'story is' if total == 1 else 'stories are'} up ✅" if n else \
+        f"{label}: none of the {total} queued {'story' if total == 1 else 'stories'} could be posted"
+    lines = [f"• {db.post_headline(aid) or 'Story'}: {link or '(posted)'}" for aid, link in result.posted]
+    if result.failed:
+        lines += ["", "Not posted:"] + [f"• {db.post_headline(aid) or 'Story'} ({why})" for aid, why in result.failed]
+    return "\n".join([text, *lines])
+
+
+def x_queue(stop: threading.Event, every: float = 30.0) -> None:
+    """Post queued X stories when their time comes; tell the owner when an approval's batch is done."""
+    db = Database(settings.db_path)
+    while not stop.is_set():
+        try:
+            for _, result in XPublisher(settings, db).post_due():
+                if settings.whatsapp_enabled:
+                    OutboxClient(db).send_text(settings.whatsapp_owner, batch_message(db, "X", result))
+        except Exception:  # keep the queue alive
+            log.exception("X queue failed")
+        stop.wait(every)
+
+
+RECAP_ATTEMPTS = 3
+
+
+def make_recap(db: Database, day: str, out_dir) -> tuple[list, str, object] | None:
+    """Render the day's recap video; None when fewer than two stories were posted."""
+    rows = recap.pick(db.published_between(*recap.day_bounds(day, settings.timezone)), settings.recap_max_stories)
+    if len(rows) < 2:
+        return None
+    date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
+    handle = InstagramPublisher(settings, db)._handle_name() if settings.instagram_enabled else ""
+    video = out_dir / f"recap-{day}.mp4"
+    cover = recap.render(rows, date_label, handle, settings.brand_name, Fonts(settings.font_bold, settings.font_regular),
+                         video)
+    return rows, str(video), cover
+
+
+def post_recap(db: Database, day: str) -> str:
+    """Make and post the day's recap Reel once; tells the owner on WhatsApp. Returns what happened."""
+    key = f"recap:{day}"
+    if db.get_state(key):
+        return f"already done ({db.get_state(key)})"
+    tries = int(db.get_state(f"{key}:attempts") or 0) + 1
+    db.set_state(f"{key}:attempts", str(tries))
+    notify = (lambda text: OutboxClient(db).send_text(settings.whatsapp_owner, text)) if settings.whatsapp_enabled \
+        else (lambda text: log.info("Recap: %s", text))
+    try:
+        made = make_recap(db, day, settings.output_dir / "recaps")
+        if made is None:
+            db.set_state(key, "skipped: fewer than two stories posted")
+            return "skipped: fewer than two stories posted"
+        rows, video, cover = made
+        date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
+        tags = merge_hashtags(recap.hashtags(rows))
+        media_id, link = InstagramPublisher(settings, db).publish_reel(
+            f"recaps/{day}", Path(video).read_bytes(), cover, recap.caption(rows, date_label, tags))
+    except Exception as exc:
+        log.exception("Daily recap failed (attempt %d)", tries)
+        if tries >= RECAP_ATTEMPTS:
+            db.set_state(key, f"failed: {exc}")
+            notify(f"Today's recap Reel couldn't be posted ({type(exc).__name__}: {str(exc)[:120]}).")
+        return f"failed: {exc}"
+    db.set_state(key, link or media_id)
+    notify(f"🎬 Today's recap Reel is up: {len(rows)} stories in one video.\n{link}")
+    return f"posted {link}"
+
+
+def recap_due(now_local: datetime, recap_time: str) -> bool:
+    """From the recap time until quiet hours start (or midnight), once a day."""
+    if recap_time.lower() == "off":
+        return False
+    hour, minute = (int(x) for x in recap_time.split(":"))
+    start = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    end = now_local.replace(hour=23, minute=0, second=0, microsecond=0)
+    return start <= now_local < max(end, start + timedelta(minutes=30))
+
+
+def daily_recap(stop: threading.Event, every: float = 60.0) -> None:
+    """At JUSTNEWS_RECAP_TIME each day, post the recap Reel (once; up to three attempts)."""
+    db = Database(settings.db_path)
+    while not stop.is_set():
+        try:
+            local = utcnow().astimezone(ZoneInfo(settings.timezone))
+            day = local.date().isoformat()
+            if recap_due(local, settings.recap_time) and not db.get_state(f"recap:{day}") \
+                    and int(db.get_state(f"recap:{day}:attempts") or 0) < RECAP_ATTEMPTS:
+                log.info("Daily recap for %s: %s", day, post_recap(db, day))
+        except Exception:
+            log.exception("Daily recap check failed")
+        stop.wait(every)
+
+
+def cmd_recap(db: Database, args) -> str:
+    """Make today's (or --day's) recap; --dry-run renders the video without posting it."""
+    day = args.day or utcnow().astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+    if args.dry_run:
+        made = make_recap(db, day, settings.output_dir / "recaps")
+        print(json.dumps({"day": day, "video": made[1] if made else None,
+                          "stories": [r["headline"] for r in made[0]] if made else []}, indent=2))
+        return ""
+    print(json.dumps({"day": day, "result": post_recap(db, day)}, indent=2))
+    return ""
 
 
 def run_cycle(db: Database, run_id: str | None = None) -> str:
@@ -294,6 +484,10 @@ def cmd_serve(db: Database, args) -> str:
         raise SystemExit("Set WHATSAPP_OWNER_NUMBER in .env first.")
     stop = threading.Event()
     threading.Thread(target=scheduler, args=(args.every, stop), name="scheduler", daemon=True).start()
+    if settings.x_enabled:
+        threading.Thread(target=x_queue, args=(stop,), name="x-queue", daemon=True).start()
+    if settings.instagram_enabled:
+        threading.Thread(target=daily_recap, args=(stop,), name="daily-recap", daemon=True).start()
     log.info("Serving: news cycle every %d minutes, WhatsApp approvals from %s", args.every, settings.whatsapp_owner)
     try:
         return cmd_whatsapp(db, args)
@@ -314,6 +508,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("reply", help='apply an approval reply, e.g. reply "1 3"')
     p.add_argument("text")
     p.set_defaults(func=cmd_reply)
+    p = sub.add_parser("recap", help="post the day's recap Reel now (--dry-run: only make the video)")
+    p.add_argument("--day", default=None, help="YYYY-MM-DD, default today")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_recap)
+    p = sub.add_parser("research", help='search the news on a topic and send a shortlist, e.g. research "AQI today"')
+    p.add_argument("topic")
+    p.set_defaults(func=cmd_research)
     p = sub.add_parser("serve", help="production: WhatsApp bridge + a news cycle every --every minutes")
     p.add_argument("--every", type=int, default=settings.cycle_minutes, help="minutes between cycles")
     p.add_argument("--pair-code", metavar="SPARE_NUMBER", default=None, help=argparse.SUPPRESS)

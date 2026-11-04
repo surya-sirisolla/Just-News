@@ -99,12 +99,20 @@ class Base(unittest.TestCase):
 
 
 class TextTests(unittest.TestCase):
-    def test_x_post_labels(self):
-        self.assertEqual(_x_post("BREAKING: Apple opens store", fresh=True), "Apple opens store")
-        self.assertEqual(_x_post("JUST IN: Apple opens store", fresh=False), "Apple opens store")
-        self.assertEqual(_x_post("JUST IN: Apple opens store", fresh=True), "JUST IN: Apple opens store")
-        self.assertEqual(_x_post("🇮🇳 JUST IN: India wins", fresh=False), "🇮🇳 India wins")
-        self.assertEqual(_x_post("Apple opens store #Apple https://x.co/a", fresh=True), "Apple opens store")
+    def test_x_post_credits_the_outlet_at_the_end_like_a_newspaper(self):
+        self.assertEqual(_x_post("According to The Guardian, Democrats are poised to win the House."),
+                         "Democrats are poised to win the House, The Guardian reports.")
+        p = {"x_post": "Democrats are poised to win the House, The Guardian reports.", "headline": "h", "caption": "c",
+             "hashtags": "[]", "source_name": "The Guardian", "image_kind": "graphic", "image_credit": None,
+             "x_hashtag": "#USMidterms"}
+        self.assertEqual(x_text(p), "Democrats are poised to win the House, The Guardian reports. #USMidterms")
+
+    def test_x_post_is_plain_like_a_newspaper_feed(self):
+        self.assertEqual(_x_post("BREAKING: Apple opens store"), "Apple opens store")
+        self.assertEqual(_x_post("JUST IN: Apple opens store"), "Apple opens store")
+        self.assertEqual(_x_post("🇮🇳 JUST IN: India wins"), "India wins")
+        self.assertEqual(_x_post("🇮🇳 India wins the series"), "India wins the series")
+        self.assertEqual(_x_post("Apple opens store #Apple https://x.co/a"), "Apple opens store")
 
     def test_instagram_caption_keeps_paragraphs_without_tags_or_links(self):
         text = _paragraphs("Hook line.\n\n\nSecond para #News\nThird www.site.com para", 900)
@@ -115,12 +123,12 @@ class TextTests(unittest.TestCase):
              "attribution": "Source: BBC News – https://news.google.com/rss/articles/CBMi123", "image_kind": "graphic",
              "image_credit": None, "source_name": "BBC News", "url": "https://news.google.com/rss/articles/CBMi123",
              "ig_caption": "Apple opened its first store in Pune.\n\nIt is the third in India.\n\nWould you visit?",
-             "x_post": "🇮🇳 Apple opens its first store in Pune, its third in India"}
+             "x_post": "Apple opened its first store in Pune on Friday, its third in India."}
         ig, x = instagram_caption(p), x_text(p)
         self.assertTrue(ig.startswith("Apple opened its first store in Pune.\n\n"))
         self.assertIn("#Apple #India #Retail", ig)
         self.assertTrue(ig.endswith("Source: BBC News"))  # the long Google News link is dropped
-        self.assertEqual(x, "🇮🇳 Apple opens its first store in Pune, its third in India\n\n#Apple #India\n\nSource: BBC News")
+        self.assertEqual(x, "Apple opened its first store in Pune on Friday, its third in India.\n\nSource: BBC News")
 
     def test_code_notes(self):
         self.assertEqual(code_notes(draft("P1")), [])
@@ -129,9 +137,9 @@ class TextTests(unittest.TestCase):
         self.assertTrue(any("short paragraphs" in n for n in notes))
         self.assertTrue(any("repeats the Instagram hook" in n for n in notes))
         notes = code_notes(draft("P1", ig_caption="Flights were checked according to BBC News.\n\nMore.",
-                                 x_post="Planes checked, per BBC News"), "BBC News")
+                                 x_post="According to BBC News, planes were checked"), "BBC News")
         self.assertEqual(notes, ["Instagram: don't end the hook with the attribution; move it to the next paragraph.",
-                                 "X: drop 'BBC News': the Source line is added below."])
+                                 "X: don't open with 'According to'; state the news and end with '<publisher> reports.'"])
 
     def test_source_line_drops_tracking_parameters(self):
         from justnews.agents.publisher import source_line
@@ -224,7 +232,7 @@ class DiscussionTests(Base):
                                      strategist=strategist).run("r1")
         self.assertEqual(result.created, 2)
         posts = {p["article_id"]: p for p in self.db.posts_for_run("r1")}
-        self.assertEqual(posts[a2.id]["x_post"], "🇮🇳 3rd store: Apple opens in Pune")
+        self.assertEqual(posts[a2.id]["x_post"], "3rd store: Apple opens in Pune")  # the flag is dropped
         self.assertEqual(posts[a1.id]["ig_caption"], "Hook for P1.\n\nWhat happened.\n\nWould you switch?")
         talk = [(m["sender"], m["recipient"], m["body"]) for m in self.db.agent_messages("r1")]
         self.assertTrue(talk[0][2].startswith("Instagram: the first line is"))

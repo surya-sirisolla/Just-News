@@ -78,7 +78,8 @@ def _chunks(blocks: list[str], footer: str) -> list[str]:
 class ApprovalService:
     def __init__(self, settings: Settings, db: Database, client, designer: Callable[[str, list[str]], object],
                  owner: str | None = None, assistant=None,
-                 publishers: dict[str, Callable[[str, list[str]], object]] | None = None):
+                 publishers: dict[str, Callable[[str, list[str]], object]] | None = None,
+                 researcher: Callable[[str, str], None] | None = None):
         self.settings = settings
         self.db = db
         self.client = client
@@ -87,17 +88,19 @@ class ApprovalService:
         self.assistant = assistant  # free-text understanding; None -> keyword rules only
         # Platform label -> (run_id, article ids) -> PublishResult; empty -> posting not connected.
         self.publishers = publishers or {}
+        # (topic, the owner's words) -> starts an on-demand search that sends its own shortlist.
+        self.researcher = researcher
 
     # --- outgoing ---------------------------------------------------------------
-    def request(self, run_id: str) -> dict:
-        posts = self.db.posts_awaiting_approval(run_id, self.settings.max_posts_per_run)
+    def request(self, run_id: str, title: str | None = None, limit: int | None = None) -> dict:
+        posts = self.db.posts_awaiting_approval(run_id, limit or self.settings.max_posts_per_run)
         if not posts:
             log.info("Run %s: no draft posts waiting for approval", run_id)
             return {"run_id": run_id, "requested": 0, "status": "nothing to approve"}
         items = {str(i): p["article_id"] for i, p in enumerate(posts, 1)}
         expires = datetime.now(timezone.utc) + timedelta(hours=self.settings.approval_expiry_hours)
         request_id = self.db.create_approval_request(run_id, items, expires.isoformat(timespec="seconds"), "sent")
-        self._send_shortlist(request_id)
+        self._send_shortlist(request_id, title)
         status = "shortlist sent"
         log.info("Run %s: approval request %d for %d posts (%s)", run_id, request_id, len(items), status)
         return {"run_id": run_id, "request_id": request_id, "requested": len(items), "status": status}
@@ -105,13 +108,14 @@ class ApprovalService:
     def _send(self, text: str) -> None:
         self.client.send_text(self.owner, text)
 
-    def _send_shortlist(self, request_id: int) -> None:
+    def _send_shortlist(self, request_id: int, title: str | None = None) -> None:
         req = self.db.approval_request(request_id)
         items = json.loads(req["items"])
         posts = {p["article_id"]: p for p in self.db.posts_for_run(req["run_id"])}
         blocks = [self._format_item(n, posts[aid]) for n, aid in items.items() if aid in posts]
         local = datetime.now(ZoneInfo(self.settings.timezone)).strftime("%-I:%M %p")
-        header = f"📰 *Just News* · {local} – {len(blocks)} new stories"
+        header = f"{title} · {local} – {len(blocks)} {'story' if len(blocks) == 1 else 'stories'}" if title \
+            else f"📰 *Just News* · {local} – {len(blocks)} new stories"
         following = datetime.now(timezone.utc) + timedelta(minutes=self.settings.cycle_minutes)
         quiet_end = quiet_until(self.settings, following)
         when = (f"at {local_time(self.settings, quiet_end)} (quiet hours until then)" if quiet_end
@@ -204,10 +208,22 @@ class ApprovalService:
                 log.exception("Publishing to %s failed", label)
                 blocks.append(f"Not posted on {label}: {type(exc).__name__}, see the logs")
                 continue
-            lines = [f"{number_of[aid]}. {link or '(posted)'}" for aid, link in published.posted]
-            total += len(lines)
-            if lines:
-                blocks.append(f"Posted {len(lines)} to {label}:\n" + "\n".join(lines))
+            by_link: dict[str, list[str]] = {}
+            for aid, link in published.posted:
+                by_link.setdefault(link or "(posted)", []).append(number_of[aid])
+            singles = [f"{ns[0]}. {link}" for link, ns in by_link.items() if len(ns) == 1]
+            for link, ns in by_link.items():
+                if len(ns) > 1:  # several stories in one post: an Instagram carousel
+                    blocks.append(f"Posted {_join(ns)} to {label} as one carousel:\n{link}")
+            if singles:
+                blocks.append(f"Posted {len(singles)} to {label}:\n" + "\n".join(singles))
+            total += len(published.posted)
+            queued = [number_of[aid] for aid, _ in getattr(published, "queued", [])]
+            if queued:
+                note = getattr(published, "note", "")
+                blocks.append(f"Queued {_join(queued)} for {label}" + (f" ({note})" if note else "") +
+                              ". I'll send the links when they're up.")
+                total += len(queued)
             problems: dict[str, list[str]] = {}
             for aid, why in published.failed + published.skipped:
                 problems.setdefault(why[:150], []).append(number_of.get(aid, "?"))
@@ -271,6 +287,13 @@ class ApprovalService:
             return self._approve(open_req, [], text)
         if intent == "status":
             return self._reply(reply or self._summary(stories), "status")
+        if intent == "research":
+            query = out.get("query") or text
+            if self.researcher is None:
+                return self._reply("I can't search on request here yet.", "research unavailable")
+            self.researcher(query, text)
+            return self._reply(reply or f"On it 🔎 Looking for the latest on {query}. I'll send a list in a minute or two.",
+                               f"research {query!r}")
         return self._reply(reply or fallback(text)["reply"], f"chat ({intent})")
 
     def _send_templates(self, stories: dict[int, dict], numbers: list[int], reply: str) -> str:

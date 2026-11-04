@@ -23,6 +23,7 @@ from ..config import Settings
 from ..db import Database
 from ..http import FetchError, fetch, make_session
 from ..models import Article, canonical_url, normalize_title
+from ..regions import detect_region
 from ..sources import AI_KEYWORDS, IRRELEVANT_PATTERNS, SOURCES, Source
 
 log = logging.getLogger("justnews.discovery")
@@ -75,10 +76,14 @@ class NewsDiscoveryAgent:
         self.settings = settings
         self.db = db
         self.session = make_session()
+        self.include_seen = False
 
     # --- public entry point -------------------------------------------------
-    def run(self, run_id: str) -> DiscoveryResult:
-        sources = [s for s in SOURCES if s.category in self.settings.categories]
+    def run(self, run_id: str, sources: list[Source] | None = None, include_seen: bool = False) -> DiscoveryResult:
+        """All configured sources; or, for on-demand research, the given ones, including stories
+        already seen in earlier runs (`include_seen`)."""
+        self.include_seen = include_seen
+        sources = sources if sources is not None else [s for s in SOURCES if s.category in self.settings.categories]
         log.info("Run %s: fetching %d sources across %s", run_id, len(sources), ", ".join(self.settings.categories))
 
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -147,7 +152,8 @@ class NewsDiscoveryAgent:
             description = description[len(title):].strip(" -–:")
 
         return Article(title=title, url=link, source_name=publisher, category=src.category,
-                       published_at=published, description=description, feed=src.label)
+                       published_at=published, description=description, feed=src.label,
+                       region=detect_region(title, description, src.region))
 
     @staticmethod
     def _google_description(summary_html: str, publisher: str) -> str:
@@ -181,7 +187,7 @@ class NewsDiscoveryAgent:
                 reason = "off-topic for category"
             elif canonical_url(a.url) in seen_urls or (a.category, normalize_title(a.title)) in seen_titles:
                 reason = "duplicate in this run"
-            elif a.id in already_evaluated:
+            elif a.id in already_evaluated and not self.include_seen:
                 reason = "already evaluated in an earlier run"
             if reason:
                 filtered[reason] += 1

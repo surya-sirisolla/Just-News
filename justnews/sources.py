@@ -14,14 +14,18 @@ from dataclasses import dataclass
 from urllib.parse import quote_plus
 
 GN_PARAMS = "hl=en-US&gl=US&ceid=US:en"
+GN_INDIA = "hl=en-IN&gl=IN&ceid=IN:en"  # Google News, India edition
+
+SOUTH_STATES = '"Tamil Nadu" OR Kerala OR Karnataka OR Telangana OR "Andhra Pradesh" OR Puducherry'
+SOUTH_CITIES = "Hyderabad OR Chennai OR Bengaluru OR Kochi OR Visakhapatnam OR Coimbatore OR Vijayawada"
 
 
-def google_topic(topic: str) -> str:
-    return f"https://news.google.com/rss/headlines/section/topic/{topic}?{GN_PARAMS}"
+def google_topic(topic: str, edition: str = GN_PARAMS) -> str:
+    return f"https://news.google.com/rss/headlines/section/topic/{topic}?{edition}"
 
 
-def google_search(query: str, window: str = "1d") -> str:
-    return f"https://news.google.com/rss/search?q={quote_plus(query + f' when:{window}')}&{GN_PARAMS}"
+def google_search(query: str, window: str = "1d", edition: str = GN_PARAMS) -> str:
+    return f"https://news.google.com/rss/search?q={quote_plus(query + f' when:{window}')}&{edition}"
 
 
 @dataclass(frozen=True)
@@ -30,47 +34,56 @@ class Source:
     url: str
     category: str
     kind: str = "rss"
+    region: str = "International"  # default region of its stories; the text can say otherwise (regions.py)
 
     @property
     def label(self) -> str:
         return f"{self.publisher} [{self.category}]"
 
 
+# Mostly Indian and South Indian outlets; international news comes from a few world feeds and
+# reaches the shortlist only when it is important (see regions.py).
 SOURCES: list[Source] = [
+    # India
+    Source("The Hindu", "https://www.thehindu.com/news/national/feeder/default.rss", "India", region="India"),
+    Source("The Indian Express", "https://indianexpress.com/section/india/feed/", "India", region="India"),
+    Source("NDTV", "https://feeds.feedburner.com/ndtvnews-india-news", "India", region="India"),
+    Source("The Times of India", "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", "India", region="India"),
+    Source("Hindustan Times", "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml", "India", region="India"),
+    Source("Google News", google_topic("NATION", GN_INDIA), "India", kind="google_news", region="India"),
+    # South India
+    Source("The Hindu", "https://www.thehindu.com/news/national/tamil-nadu/feeder/default.rss", "South India", region="South India"),
+    Source("The Hindu", "https://www.thehindu.com/news/national/kerala/feeder/default.rss", "South India", region="South India"),
+    Source("The Hindu", "https://www.thehindu.com/news/national/karnataka/feeder/default.rss", "South India", region="South India"),
+    Source("The Hindu", "https://www.thehindu.com/news/national/andhra-pradesh/feeder/default.rss", "South India", region="South India"),
+    Source("The Hindu", "https://www.thehindu.com/news/national/telangana/feeder/default.rss", "South India", region="South India"),
+    Source("Deccan Chronicle", "https://www.deccanchronicle.com/google_feeds.xml", "South India", region="South India"),
+    Source("Google News", google_search(SOUTH_STATES, edition=GN_INDIA), "South India", kind="google_news", region="South India"),
+    Source("Google News", google_search(SOUTH_CITIES, edition=GN_INDIA), "South India", kind="google_news", region="South India"),
+    # Business (Indian outlets, plus one international)
+    Source("The Hindu", "https://www.thehindu.com/business/feeder/default.rss", "Business", region="India"),
+    Source("The Indian Express", "https://indianexpress.com/section/business/feed/", "Business", region="India"),
+    Source("Mint", "https://www.livemint.com/rss/news", "Business", region="India"),
+    Source("The Economic Times", "https://economictimes.indiatimes.com/rssfeedstopstories.cms", "Business", region="India"),
+    Source("Google News", google_topic("BUSINESS", GN_INDIA), "Business", kind="google_news", region="India"),
+    Source("BBC News", "https://feeds.bbci.co.uk/news/business/rss.xml", "Business"),
     # Technology
+    # (Indian outlets' tech and AI sections carry global stories too: the text decides the region.)
+    Source("The Indian Express", "https://indianexpress.com/section/technology/feed/", "Technology"),
+    Source("The Hindu", "https://www.thehindu.com/sci-tech/technology/feeder/default.rss", "Technology"),
+    Source("Mint", "https://www.livemint.com/rss/technology", "Technology"),
+    Source("Google News", google_topic("TECHNOLOGY", GN_INDIA), "Technology", kind="google_news"),
     Source("TechCrunch", "https://techcrunch.com/feed/", "Technology"),
     Source("The Verge", "https://www.theverge.com/rss/index.xml", "Technology"),
-    Source("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "Technology"),
-    Source("Wired", "https://www.wired.com/feed/rss", "Technology"),
-    Source("Engadget", "https://www.engadget.com", "Technology", kind="site"),
-    Source("Google News", google_topic("TECHNOLOGY"), "Technology", kind="google_news"),
     # AI
+    Source("Google News", google_search('"artificial intelligence" OR AI', edition=GN_INDIA), "AI", kind="google_news"),
     Source("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/", "AI"),
     Source("The Verge", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "AI"),
     Source("MIT Technology Review", "https://www.technologyreview.com/topic/artificial-intelligence/feed", "AI"),
-    Source("VentureBeat", "https://venturebeat.com/category/ai/feed/", "AI"),
-    Source(
-        "Google News",
-        google_search('"artificial intelligence" OR OpenAI OR Anthropic OR "Google DeepMind" OR "AI model"'),
-        "AI",
-        kind="google_news",
-    ),
-    # Business
-    Source("CNBC", "https://www.cnbc.com/id/10001147/device/rss/rss.html", "Business"),
-    Source("BBC News", "https://feeds.bbci.co.uk/news/business/rss.xml", "Business"),
-    Source("The Guardian", "https://www.theguardian.com/uk/business/rss", "Business"),
-    Source("Google News", google_topic("BUSINESS"), "Business", kind="google_news"),
-    # Politics
-    Source("NPR", "https://feeds.npr.org/1014/rss.xml", "Politics"),
-    Source("Politico", "https://rss.politico.com/politics-news.xml", "Politics"),
-    Source("The Hill", "https://thehill.com/news/feed/", "Politics"),
-    Source("Google News", google_search("politics OR election OR congress OR parliament"), "Politics", kind="google_news"),
     # World
     Source("BBC News", "https://feeds.bbci.co.uk/news/world/rss.xml", "World"),
     Source("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", "World"),
-    Source("The Guardian", "https://www.theguardian.com/world/rss", "World"),
-    Source("NPR", "https://feeds.npr.org/1004/rss.xml", "World"),
-    Source("Google News", google_topic("WORLD"), "World", kind="google_news"),
+    Source("Google News", google_topic("WORLD", GN_INDIA), "World", kind="google_news"),
 ]
 
 # Baseline credibility (0-100) by publisher. Keys are lowercase substrings matched
@@ -86,6 +99,13 @@ SOURCE_CREDIBILITY: dict[str, int] = {
     "techcrunch": 86, "engadget": 82, "venturebeat": 80, "zdnet": 80, "cnet": 80,
     "the information": 89, "forbes": 78, "business insider": 78, "fortune": 84,
     "fox news": 75, "new york post": 68, "daily mail": 60, "yahoo": 75, "msn": 72,
+    # India
+    "the hindu": 91, "press trust of india": 90, "pti": 90, "the indian express": 88, "indian express": 88,
+    "business standard": 87, "mint": 86, "livemint": 86, "the economic times": 85, "economic times": 85,
+    "hindustan times": 83, "ndtv": 82, "the new indian express": 82, "deccan herald": 82, "theprint": 82,
+    "india today": 80, "scroll": 80, "the news minute": 80, "the times of india": 78, "times of india": 78,
+    "moneycontrol": 78, "onmanorama": 78, "mathrubhumi": 78, "ani": 78, "the federal": 75, "the quint": 74,
+    "deccan chronicle": 72, "firstpost": 72, "telangana today": 70, "news18": 70, "zee news": 60,
 }
 
 # Headline patterns that are obviously not news worth posting (deals, shopping

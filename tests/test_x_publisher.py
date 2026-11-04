@@ -73,8 +73,9 @@ class TextTests(unittest.TestCase):
         self.assertNotIn("http", text)
         self.assertNotIn(".com", text)
         self.assertNotIn("www.", text)
-        self.assertIn("#Apple #India", text)
-        self.assertNotIn("#Retail", text)  # two hashtags at most
+        self.assertNotIn("#", text)  # like a newspaper's feed: no hashtags unless the story has an established one
+        tagged = x_text(post_row(x_post="Voting began in the US midterm elections on Tuesday.", x_hashtag="#USMidterms"))
+        self.assertEqual(tagged, "Voting began in the US midterm elections on Tuesday. #USMidterms\n\nSource: Reuters")
 
     def test_long_text_drops_caption_then_hashtags_but_keeps_credit(self):
         credit = "File photo: Jane Doe / Wikimedia Commons, CC BY-SA 4.0"
@@ -135,9 +136,56 @@ class XPublisherTests(unittest.TestCase):
         self.db.conn.close()
         self.tmp.cleanup()
 
-    def publisher(self, x=None):
+    def publisher(self, x=None, spacing=0, clock=None):
         self.x = x or FakeX()
-        return XPublisher(self.settings, self.db, session=self.x, sleep=lambda s: None)
+        return XPublisher(self.settings, self.db, session=self.x, sleep=lambda s: None, spacing=spacing, clock=clock)
+
+    def test_stories_are_queued_and_posted_one_every_few_minutes(self):
+        t0 = datetime(2026, 11, 4, 4, 0, tzinfo=timezone.utc)  # 9:30 AM IST
+        now = [t0]
+        pub = self.publisher(spacing=5, clock=lambda: now[0])
+        result = pub.publish("r1", self.ids)
+        self.assertEqual([w for _, w in result.queued],
+                         ["2026-11-04T04:00:00+00:00", "2026-11-04T04:05:00+00:00", "2026-11-04T04:10:00+00:00"])
+        self.assertEqual(result.note, "one every 5 minutes, 9:30 AM to 9:40 AM")
+        self.assertEqual(result.posted, [])
+        self.assertEqual(pub.post_due(), [])  # the first is posted; the batch isn't finished yet
+        self.assertEqual(len(self.x.live), 1)
+        now[0] = t0 + timedelta(minutes=4)
+        self.assertEqual(pub.post_due(), [])
+        self.assertEqual(len(self.x.live), 1)  # not yet time for the second
+        later = self.publisher(x=self.x, spacing=5, clock=lambda: now[0]).publish("r1", [])  # nothing new
+        self.assertEqual(later.queued, [])
+        now[0] = t0 + timedelta(minutes=10)
+        (batch, done), = pub.post_due()
+        self.assertEqual(len(done.posted), 3)
+        self.assertEqual([a for a, _ in done.posted], self.ids)  # in queue order
+        self.assertEqual(len(self.x.live), 3)
+
+    def test_a_second_approval_queues_after_the_first(self):
+        t0 = datetime(2026, 11, 4, 4, 0, tzinfo=timezone.utc)
+        pub = self.publisher(spacing=5, clock=lambda: t0)
+        pub.publish("r1", self.ids[:2])
+        second = pub.publish("r1", [self.ids[2]])
+        self.assertEqual(second.queued[0][1], "2026-11-04T04:10:00+00:00")
+
+    def test_stale_queue_items_are_dropped_not_posted(self):
+        t0 = datetime(2026, 11, 4, 4, 0, tzinfo=timezone.utc)
+        now = [t0]
+        pub = self.publisher(spacing=5, clock=lambda: now[0])
+        pub.publish("r1", [self.ids[0]])
+        now[0] = t0 + timedelta(hours=4)  # e.g. the server was down
+        (_, done), = pub.post_due()
+        self.assertEqual(self.x.live, [])
+        self.assertIn("not posted within 3 hours", done.failed[0][1])
+        self.assertEqual(self.db.publication(self.ids[0], "x")["status"], "expired")
+        self.assertEqual(self.db.failed_publications("x", 3, 2), [])  # and not retried later
+
+    def test_daily_limit_applies_to_the_queue(self):
+        self.settings = replace(self.settings, max_posts_per_day=1)
+        result = self.publisher().publish("r1", self.ids[:2])
+        self.assertEqual(len(result.posted), 1)
+        self.assertIn("daily limit", result.failed[0][1])
 
     def test_uploads_image_then_posts_with_media_and_signed_requests(self):
         result = self.publisher().publish("r1", self.ids[:2])

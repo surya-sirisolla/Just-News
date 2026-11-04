@@ -1,8 +1,11 @@
 """Agent 5 on X: posts owner-approved templates to X (API v2), signed as the account itself.
 
-For each post:
+Like a newsroom feed (The Hindu's on X): one post per story, a plain news sentence, rarely a
+hashtag, and posts spaced out (JUSTNEWS_X_SPACING_MINUTES) rather than in a burst. Approved stories
+are queued; `post_due()` (run every 30 seconds by `serve`) posts each one when its time comes:
   1. POST /2/media/upload with the JPEG (media_category=tweet_image) -> a media id
   2. POST /2/tweets with the text and that media id -> the live post
+A queued story not posted within JUSTNEWS_X_QUEUE_MAX_HOURS is dropped instead of posted stale.
 The text carries no link: on X's pay-per-use pricing a post with a URL costs about 13x more, so the
 source is named instead. X also rejects a post whose text matches a recent one, which is a second
 guard (after the `publications` table) against posting the same story twice.
@@ -14,24 +17,25 @@ import base64
 import hashlib
 import hmac
 import html
-import json
 import logging
 import re
 import secrets
 import time
 import urllib.parse as up
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 
 from ..config import Settings
 from ..db import Database
-from .publisher import TIMEOUT, Publisher, PublishError, field_of, to_jpeg
+from ..quiet import local_time
+from .publisher import TIMEOUT, Publisher, PublishError, PublishResult, field_of, to_jpeg
 
 log = logging.getLogger("justnews.publisher")
 
 API = "https://api.x.com/2"
 TEXT_MAX = 280
-HASHTAG_MAX = 2  # hashtags add little reach on X; more than a couple reads as spam
 NO_CREDITS = "X needs Pay-Per-Use credits for posting (console.x.com → Billing)"
 
 URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.I)
@@ -82,22 +86,25 @@ def _cut(text: str, room: int) -> str:
 
 
 def x_text(p) -> str:
-    """The X version written by the content creator (or headline + caption for older posts), up to
-    two hashtags, the source and (for licensed photos) the photo credit, in 280. Hashtags, then the
-    caption, are dropped first when everything doesn't fit."""
+    """The X version: the content creator's news sentence (or headline + caption for older posts),
+    a hashtag only when the story has an established one, then the source and (for licensed
+    photos) the photo credit, in 280. The caption, then the hashtag, are dropped first."""
     x_post = _unlink(field_of(p, "x_post") or "")
-    headline = x_post or _unlink(p["headline"])
-    source = f"Source: {_unlink(p['source_name'])}"
+    body = x_post or _unlink(p["headline"])
+    tag = field_of(p, "x_hashtag") or ""
+    publisher = _unlink(p["source_name"])
+    # "..., The Guardian reports." already credits the source; then only a photo credit follows.
+    source = "" if publisher and publisher.lower() in body.lower() else f"Source: {publisher}"
     if p["image_kind"] == "photo" and p["image_credit"]:
-        source += f" · {_unlink(p['image_credit'])}"  # CC BY/BY-SA require attribution
-    tags = json.loads(p["hashtags"])[:HASHTAG_MAX]
+        credit = _unlink(p["image_credit"])  # CC BY/BY-SA require attribution
+        source = f"{source} · {credit}" if source else credit
     caption = "" if x_post else _unlink(p["caption"])
-    for parts in ([headline, caption, " ".join(tags), source], [headline, " ".join(tags), source],
-                  [headline, " ".join(tags[:1]), source], [headline, source]):
+    tagged = f"{body} {tag}" if tag else body
+    for parts in ([tagged, caption, source], [tagged, source], [body, source]):
         text = "\n\n".join(x for x in parts if x)
         if x_length(text) <= TEXT_MAX:
             return text
-    return _cut(headline, TEXT_MAX - x_length(source) - 2) + "\n\n" + source
+    return _cut(body, TEXT_MAX - x_length(source) - 2) + ("\n\n" + source if source else "")
 
 
 def _comparable(text: str) -> str:
@@ -109,9 +116,12 @@ class XPublisher(Publisher):
     platform = "x"
     label = "X"
 
-    def __init__(self, settings: Settings, db: Database, session=None, sleep=time.sleep):
+    def __init__(self, settings: Settings, db: Database, session=None, sleep=time.sleep,
+                 spacing: float | None = None, clock=None):
         super().__init__(settings, db, sleep)
         self.session = session or requests.Session()
+        self.spacing = settings.x_spacing_minutes if spacing is None else spacing  # minutes between posts
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.consumer = (settings.x_api_key, settings.x_api_secret)
         self.token = (settings.x_access_token, settings.x_access_token_secret)
         self.user_id = settings.x_access_token.split("-", 1)[0]  # access tokens start with the account's ID
@@ -228,3 +238,77 @@ class XPublisher(Publisher):
             log.warning("  post call failed but the post is live: %s", live[1])
             return live
         return post_id, f"https://x.com/i/status/{post_id}"
+
+    # --- the queue: one post per story, spaced out ----------------------------------------
+    def publish(self, run_id: str, article_ids: list[str]) -> PublishResult:
+        """Queue the stories, one every `spacing` minutes after anything already queued. With no
+        spacing (the `publish` command, tests) they are posted right away."""
+        result = PublishResult()
+        posts = {p["article_id"]: p for p in self.db.posts_for_run(run_id)}
+        now = self.clock()
+        waiting = self.db.queued_publications(self.platform)
+        at = max([now] + [datetime.fromisoformat(r["scheduled_at"]) + timedelta(minutes=self.spacing)
+                          for r in waiting[-1:]])
+        batch = f"{run_id}@{now.isoformat(timespec='seconds')}"
+        for aid in article_ids:
+            if not self._ready(aid, posts.get(aid), result):
+                continue
+            when = at.isoformat(timespec="seconds")
+            self.db.queue_publication(aid, self.platform, when, batch)
+            result.queued.append((aid, when))
+            at += timedelta(minutes=self.spacing)
+        if not self.spacing:
+            for done_batch, done in self.post_due():
+                if done_batch == batch:
+                    result.posted += done.posted
+                    result.failed += done.failed
+            result.queued = []
+        elif result.queued:
+            times = [local_time(self.settings, datetime.fromisoformat(w)) for _, w in result.queued]
+            result.note = (f"at {times[0]}" if len(times) == 1
+                           else f"one every {self.spacing:g} minutes, {times[0]} to {times[-1]}")
+        return result
+
+    def post_due(self) -> list[tuple[str, PublishResult]]:
+        """Post the queued stories whose time has come. Returns the batches (one per approval) that
+        are now complete, each with what happened to its stories."""
+        now = self.clock()
+        due = [r for r in self.db.queued_publications(self.platform)
+               if datetime.fromisoformat(r["scheduled_at"]) <= now]
+        if not due:
+            return []
+        budget = self.settings.max_posts_per_day - self.db.published_since(self.platform, 24)
+        stop = False
+        for r in due:
+            aid = r["article_id"]
+            if stop:
+                self.db.save_publication(aid, self.platform, "blocked", error="not attempted after a token/permission error")
+                continue
+            if now - datetime.fromisoformat(r["scheduled_at"]) > timedelta(hours=self.settings.x_queue_max_hours):
+                self.db.save_publication(aid, self.platform, "expired",
+                                         error=f"not posted within {self.settings.x_queue_max_hours:g} hours, so dropped")
+                continue
+            if budget <= 0:
+                self.db.save_publication(aid, self.platform, "skipped",
+                                         error=f"daily limit of {self.settings.max_posts_per_day} posts reached")
+                continue
+            p = next((x for x in self.db.posts_for_run(r["run_id"]) if x["article_id"] == aid), None)
+            if p is None or not p["image_path"] or not Path(p["image_path"]).exists():
+                self.db.save_publication(aid, self.platform, "blocked", error="no template image")
+                continue
+            done = PublishResult()
+            stop = not self._post(r["run_id"], p, done)
+            budget -= len(done.posted)
+        finished = []
+        for batch in dict.fromkeys(r["batch"] for r in due):
+            rows = self.db.batch_publications(self.platform, batch)
+            if any(row["status"] == "queued" for row in rows):
+                continue
+            result = PublishResult()
+            for row in rows:
+                if row["status"] == "published":
+                    result.posted.append((row["article_id"], row["permalink"] or ""))
+                else:
+                    result.failed.append((row["article_id"], row["error"] or row["status"]))
+            finished.append((batch, result))
+        return finished

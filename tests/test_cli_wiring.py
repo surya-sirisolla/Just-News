@@ -30,7 +30,7 @@ NO_KEYS = dict(instagram_token="", x_api_key="", whatsapp_owner="")
 
 def fake_publisher(platform, label, calls, retry=None, crash=False):
     class Fake:
-        def __init__(self, settings, db):
+        def __init__(self, settings, db, **kw):
             self.platform, self.label = platform, label
 
         def publish(self, run_id, ids):
@@ -145,6 +145,41 @@ class WiringTests(unittest.TestCase):
         printed = json.loads(out.getvalue())
         self.assertEqual(set(printed), {"run_id", "instagram", "x"})
         self.assertEqual(self.calls, [("Instagram", "r1", [self.ids[0]]), ("X", "r1", [self.ids[0]])])
+
+    def test_queued_x_posts_are_announced_and_summarised_when_done(self):
+        self.use(**IG_KEYS, **X_KEYS, whatsapp_owner=OWNER)
+        service = cli.approval_service(self.db)
+        service.designer = lambda run_id, ids: NS(photos=0, graphics=len(ids), failed=0)
+        service.publishers["X"] = lambda run_id, ids: PublishResult(
+            queued=[(a, f"2026-11-04T04:{i * 5:02d}:00+00:00") for i, a in enumerate(ids)],
+            note="one every 5 minutes, 9:30 AM to 9:40 AM")
+        service.request("r1")
+        service.handle_message(Incoming("m1", OWNER, "1 2 3", 0))
+        reply = self.outbox()[-1]
+        self.assertIn("Queued 1, 2 and 3 for X (one every 5 minutes, 9:30 AM to 9:40 AM). "
+                      "I'll send the links when they're up.", reply)
+        done = PublishResult(posted=[(self.ids[0], "https://x.com/i/status/1")], failed=[(self.ids[1], "expired")])
+        self.assertEqual(cli.batch_message(self.db, "X", done),
+                         "X: 1 of 2 stories are up ✅\n• Headline 1: https://x.com/i/status/1\n\n"
+                         "Not posted:\n• Headline 2 (expired)")
+
+    def test_x_queue_worker_posts_due_stories_and_messages_the_owner(self):
+        import threading
+        done = PublishResult(posted=[(self.ids[0], "https://x.com/i/status/1")])
+        stop = threading.Event()
+
+        class Queue:
+            def __init__(self, settings, db, **kw):
+                pass
+
+            def post_due(self):
+                stop.set()
+                return [("batch", done)]
+
+        self.use(x=Queue, **X_KEYS, whatsapp_owner=OWNER)
+        with mock.patch.object(cli, "Database", return_value=self.db):
+            cli.x_queue(stop, every=0)
+        self.assertEqual(self.outbox(), ["X: 1 of 1 story is up ✅\n• Headline 1: https://x.com/i/status/1"])
 
     def test_publish_command_needs_keys(self):
         self.use()

@@ -79,7 +79,7 @@ class AgentTests(unittest.TestCase):
 
     def recommend(self, *titles, run_id="r1"):
         arts = [Article(title=t, url=f"https://reuters.com/{i}", source_name="Reuters", category="Politics",
-                        published_at=NOW - timedelta(hours=1), description="Summary of the story.")
+                        published_at=NOW - timedelta(hours=1), description="Summary of the story.", region="India")
                 for i, t in enumerate(titles)]
         self.db.create_run(run_id)
         self.db.save_discovered(run_id, arts)
@@ -96,6 +96,12 @@ class AgentTests(unittest.TestCase):
         source = "Trump, Vance and candidates make final push before US midterms in 2026"
         self.assertEqual(normalize_hashtags(["USPolitics", "Campaign2024", "Midterms2026", "WiredNews"], source, "Wired"),
                          ["#USPolitics", "#Midterms2026"])
+
+    def test_hashtags_skip_generic_filler_and_made_up_compounds(self):
+        tags = ["News", "BreakingNews", "WorldNews", "AppleRecordQuarterSales", "Apple", "iPhone", "USMidterms",
+                "ArtificialIntelligence", "Trending"]
+        self.assertEqual(normalize_hashtags(tags), ["#Apple", "#iPhone", "#USMidterms", "#ArtificialIntelligence"])
+        self.assertEqual(normalize_hashtags(["News", "Latest"]), [])  # none is fine
 
     def test_creates_validated_drafts_with_code_built_attribution(self):
         arts = self.recommend("Automakers urge Congress to ban Chinese vehicles", "Second story")
@@ -177,6 +183,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(post["image_credit"], "File photo: Jane Doe / Wikimedia Commons, CC BY 4.0")
         self.assertEqual(post["image_license"], "CC BY 4.0")
         self.assertNotIn("nc.jpg", " ".join(session.fetched))  # the NC-licensed result was never downloaded
+        self.assertTrue(Path(post["photo_path"]).exists())  # the photo alone, for carousel slides
 
     def test_poor_photo_fit_falls_back_to_graphic(self):
         self.make_posts("photo", "Microsoft headquarters")

@@ -16,7 +16,7 @@ from .llm import LLMError
 
 log = logging.getLogger("justnews.assistant")
 
-INTENTS = ["approve", "send_templates", "show_shortlist", "reject_all", "status", "chat"]
+INTENTS = ["approve", "send_templates", "show_shortlist", "reject_all", "status", "research", "chat"]
 
 SYSTEM_PROMPT = """You are the Just News assistant, chatting on WhatsApp with the account owner,
 who decides which news stories get a designed template (image) and get posted.
@@ -38,6 +38,9 @@ Choose one intent:
 - show_shortlist: they want the list of stories again.
 - reject_all: they want none of the stories.
 - status: they ask what's going on, what's pending, or what's ready.
+- research: they ask you to look up news on a topic ("research on AQI today", "any news on
+  Chennai rains?", "find the latest on ISRO"). Put the topic in `query`: 1-6 words, without time
+  words like "today". In `reply`, say you're on it; the app searches and sends a numbered list.
 - chat: anything else (greetings, thanks, questions). Answer helpfully, and mention that they can
   reply with story numbers or ask for templates when that helps.
 
@@ -50,18 +53,34 @@ SCHEMA = {
         "intent": {"type": "string", "enum": INTENTS},
         "numbers": {"type": "array", "items": {"type": "integer"}},
         "reply": {"type": "string"},
+        "query": {"type": "string"},
     },
-    "required": ["intent", "numbers", "reply"],
+    "required": ["intent", "numbers", "reply", "query"],
 }
 
 TEMPLATE_WORDS = re.compile(r"\b(template|templates|image|images|pic|pics|picture|photo|design|designs|send)\b", re.I)
 LIST_WORDS = re.compile(r"\b(list|stories|news|shortlist|options)\b", re.I)
 STATUS_WORDS = re.compile(r"\b(status|pending|ready|done|update)\b", re.I)
+RESEARCH_WORDS = re.compile(r"\b(research|search|look up|find|any news|news on|news about|latest on)\b", re.I)
+QUERY_NOISE = re.compile(
+    r"\b(can you|could you|please|pls|do (a |some )?|research(ing)?|search(ing)?( for)?|look up|find( me)?|"
+    r"get( me)?|any|the|latest|news|updates?|stories|on|about|for|regarding|today|tonight|now|this week|"
+    r"yesterday|right now)\b", re.I)
+
+
+def clean_query(text: str) -> str:
+    """"research on AQI today" -> "AQI"; falls back to the text itself."""
+    words = " ".join(QUERY_NOISE.sub(" ", text).replace("?", " ").split()).strip(" .,!-")
+    return words or text.strip()
 
 
 def fallback(text: str) -> dict:
     """Keyword rules, used when no Gemini model is available."""
     numbers = [int(n) for n in re.findall(r"\d+", text)]
+    if RESEARCH_WORDS.search(text):
+        query = clean_query(text)
+        return {"intent": "research", "numbers": [], "query": query,
+                "reply": f"On it 🔎 Looking for the latest on {query}. I'll send a list in a minute or two."}
     if TEMPLATE_WORDS.search(text):
         return {"intent": "send_templates", "numbers": numbers, "reply": "Here you go 👇"}
     if LIST_WORDS.search(text):
@@ -87,5 +106,9 @@ class Assistant:
                 continue
             if isinstance(out, dict) and out.get("intent") in INTENTS:
                 numbers = [n for n in out.get("numbers") or [] if isinstance(n, int)]
-                return {"intent": out["intent"], "numbers": numbers, "reply": str(out.get("reply") or "")[:1000]}
+                query = " ".join(str(out.get("query") or "").split())[:80]
+                if out["intent"] == "research" and not query:
+                    query = clean_query(text)
+                return {"intent": out["intent"], "numbers": numbers, "reply": str(out.get("reply") or "")[:1000],
+                        "query": query}
         return fallback(text)

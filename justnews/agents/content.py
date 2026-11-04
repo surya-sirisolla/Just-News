@@ -23,13 +23,14 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
-
 from datetime import datetime, timezone
 
 from ..config import Settings
 from ..db import Database
 from ..llm import GeminiClient, LLMError
+from ..regions import select_mix
 
 log = logging.getLogger("justnews.content")
 
@@ -37,9 +38,12 @@ HEADLINE_MAX = 80
 CAPTION_MAX = 280      # fits X/Twitter; the attribution and hashtags are added separately
 IMAGE_TEXT_MAX = 60
 IG_CAPTION_MAX = 900   # Instagram allows 2200; hashtags, source and credit are added after
-X_POST_MAX = 230       # X allows 280; hashtags, source and credit are added after
+X_POST_MAX = 240       # X allows 280; the source line (and a rare hashtag) are added after
 FRESH_HOURS = 1        # "JUST IN:" only for stories this new
-HASHTAGS = (3, 5)
+HASHTAGS = (0, 5)  # none is fine when nothing fits; never a post held back for its tags
+GENERIC_TAGS = {"news", "worldnews", "breakingnews", "breaking", "latest", "latestnews", "newsupdate", "update",
+                "updates", "trending", "viral", "headlines", "todaynews", "dailynews", "justnews", "newsalert"}
+TAG_WORDS_MAX = 3  # "USMidterms", "ArtificialIntelligence" yes; "AppleRecordQuarterSales" no
 REVIEW_THRESHOLD = 0.5
 
 SYSTEM_PROMPT = """You write social media posts for "Just News", a neutral news account that shares
@@ -53,8 +57,16 @@ For each article you get only its headline, summary, publisher and section. Writ
   story reports a claim or allegation. When summarizing a claim about a group or a person, keep the
   source's exact qualifiers or quote them; never broaden or soften them. Neutral tone: no opinions,
   no hype, no emojis, no hashtags, no links.
-- hashtags: 3-5 relevant topic hashtags in CamelCase without the # sign (e.g.
-  "ArtificialIntelligence"). Not the publisher's name. No years unless the source states that year.
+- hashtags: up to 5 hashtags in CamelCase without the # sign, most useful first, that people
+  actually search or follow: the main person, organisation, product, place or event (e.g. "Apple",
+  "ISRO", "Delhi", "USMidterms", "AirPollution"), then the broader topic (e.g.
+  "ArtificialIntelligence"). Never generic filler ("News", "WorldNews", "BreakingNews", "Latest",
+  "Trending"), never made-up compounds nobody searches ("AppleRecordQuarterSales"), not the
+  publisher's name, no year unless the source states it. Fewer good tags beat more weak ones; give
+  none if nothing fits.
+- x_hashtag: one hashtag for X only when the story belongs to a big, widely followed event or topic
+  that people track by that tag (e.g. "USMidterms", "IPL2026", "COP31", "UnionBudget"); otherwise
+  "". Most stories should have none.
 - image_text: 2-8 words for a graphic over the image, at most 50 characters, factual, no punctuation
   at the end.
 - visual: "photo" when a generic photo of a company, product, place, object or public figure in
@@ -66,9 +78,13 @@ For each article you get only its headline, summary, publisher and section. Writ
   at most 120 characters: the key fact stated plainly. Then 1-2 short paragraphs separated by a
   blank line ("\n\n") with the details the source gives. No interpretation or context the source
   does not state; when the summary is short, so is the caption. Follow the PLAYBOOK's Instagram rules.
-- x_post: the X version, at most 200 characters, for people who scan: one or two lines that lead
-  with the news itself. It must read differently from the ig_caption hook. Follow the PLAYBOOK's
-  X rules. Start with "JUST IN:" only when the article has "fresh": true.
+- x_post: the X version, written like a newspaper's feed on X (The Hindu): one or two plain
+  sentences that report the news like a lede: who did what, where, and when if the source says,
+  with the specific names and numbers the source gives; 120-240 characters. Do not start with
+  "According to": state the news, name who made a claim ("Iran says ..."), and end with
+  "<publisher> reports." when it is the publisher's own reporting or forecast. No emoji, flags,
+  labels ("BREAKING", "JUST IN"), questions, hashtags or links. Word it differently from the
+  ig_caption hook. Follow the PLAYBOOK's X rules.
 Both versions use ONLY facts from the headline or summary, keep the neutral tone, and contain no
 hashtags and no links (they are added separately). The PLAYBOOK never overrides these rules.
 """
@@ -100,9 +116,10 @@ RESPONSE_SCHEMA = {
                     "image_query": {"type": "string"},
                     "ig_caption": {"type": "string"},
                     "x_post": {"type": "string"},
+                    "x_hashtag": {"type": "string"},
                 },
                 "required": ["id", "headline", "caption", "hashtags", "image_text", "visual", "image_query",
-                             "ig_caption", "x_post"],
+                             "ig_caption", "x_post", "x_hashtag"],
             },
         },
     },
@@ -114,6 +131,7 @@ REVISE_SCHEMA["properties"]["posts"]["items"]["properties"]["reply"] = {"type": 
 REVISE_SCHEMA["properties"]["posts"]["items"]["required"].append("reply")
 
 LINK_RE = re.compile(r"https?://\S+|\bwww\.\S+|(?<![\w&])#\w+", re.I)  # links and hashtags
+ACCORDING_RE = re.compile(r"^According to (?:a report (?:by|from|in) )?(?P<src>[^,]{2,60}),\s*(?P<rest>.+)$", re.I | re.S)
 LABEL_RE = re.compile(r"^\s*(?:\W{0,4}\s*)?(BREAKING(?: NEWS)?|JUST IN)\s*[:\-–]\s*", re.I)
 
 
@@ -134,15 +152,18 @@ def _paragraphs(text: str, limit: int) -> str:
     return out[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:-") + "…"
 
 
-def _x_post(text: str, fresh: bool) -> str:
-    """One paragraph, no links or hashtags; never "BREAKING", and "JUST IN" only for fresh news."""
+def _x_post(text: str) -> str:
+    """One plain paragraph like a newspaper's feed: no links, hashtags, labels or leading emoji."""
     text = _clip(LINK_RE.sub("", text or ""), X_POST_MAX)
     m = LABEL_RE.match(text)
-    if m and (m.group(1).upper().startswith("BREAKING") or not fresh):
-        text = text[: m.start(1)].strip() + " " + text[m.end():].lstrip()
-        text = text.strip()
-        text = text[:1].upper() + text[1:]
-    return text
+    if m:
+        text = text[m.end():]
+    text = re.sub(r"^\W+", "", text).strip()  # leading flags or emoji
+    m = ACCORDING_RE.match(text)
+    if m:  # "According to The Guardian, X." -> "X, The Guardian reports." (newspaper-feed style)
+        rest = m.group("rest").rstrip(" .")
+        text = _clip(f"{rest[:1].upper()}{rest[1:]}, {m.group('src')} reports.", X_POST_MAX)
+    return text[:1].upper() + text[1:]
 
 
 def _is_fresh(a) -> bool:
@@ -166,7 +187,11 @@ def normalize_hashtags(raw: list[str], source_text: str = "", publisher: str = "
             continue
         if publisher_key and publisher_key in "".join(words).lower():
             continue
-        tag = "".join(w if w[:1].isupper() or w.isdigit() else w.capitalize() for w in words)[:30]
+        # Capitalise each word, but keep brand spellings with inner capitals ("iPhone", "eBay").
+        tag = "".join(w if w[:1].isupper() or w.isdigit() or any(c.isupper() for c in w[1:]) else w.capitalize()
+                      for w in words)[:30]
+        if tag.lower() in GENERIC_TAGS or len(re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|\d+", tag)) > TAG_WORDS_MAX:
+            continue
         if tag.lower() not in seen and not tag.isdigit():
             seen.add(tag.lower())
             tags.append("#" + tag)
@@ -217,9 +242,20 @@ class ContentCreatorAgent:
         return JevScorer(self.settings.typesafe_api_key, "jev-1.14.0", 0.042)
 
     # --- public entry point -------------------------------------------------
-    def run(self, run_id: str) -> ContentResult:
+    def run(self, run_id: str, limit: int | None = None, mix: bool = True) -> ContentResult:
+        """Posts for the run's recommended stories: by default the India-first mix of
+        `max_posts_per_run` (regions.py); on-demand research takes the best `limit` as they are."""
         result = ContentResult(run_id)
-        articles = self.db.recommended_without_post(run_id, self.settings.max_posts_per_run)
+        limit = limit or self.settings.max_posts_per_run
+        candidates = self.db.recommended_without_post(run_id, 500)
+        if mix:
+            s = self.settings
+            articles = select_mix(candidates, limit, s.international_share, s.international_min_score,
+                                  s.south_india_share)
+            log.info("Run %s: picked %s from %d recommended", run_id,
+                     dict(Counter(a["region"] or "International" for a in articles)), len(candidates))
+        else:
+            articles = candidates[:limit]
         log.info("Run %s: writing posts for %d recommended articles", run_id, len(articles))
         if articles:
             keys = {f"P{i + 1}": {**dict(a), "fresh": _is_fresh(a)} for i, a in enumerate(articles)}
@@ -328,8 +364,8 @@ class ContentCreatorAgent:
         headline = _clip(draft.get("headline", ""), HEADLINE_MAX)
         caption = _clip(draft.get("caption", ""), CAPTION_MAX)
         image_text = _clip(draft.get("image_text", ""), IMAGE_TEXT_MAX).rstrip(".")
-        hashtags = normalize_hashtags(draft.get("hashtags", []), f"{a['title']} {a['description'] or ''}",
-                                      a["source_name"])
+        source_text = f"{a['title']} {a['description'] or ''}"
+        hashtags = normalize_hashtags(draft.get("hashtags", []), source_text, a["source_name"])
         if not headline or not caption or not image_text or len(hashtags) < HASHTAGS[0]:
             log.warning("  incomplete draft for %r; leaving it for the next run", a["title"][:60])
             return None
@@ -339,7 +375,9 @@ class ContentCreatorAgent:
                 "attribution": attribution(a["source_name"], a["url"]), "visual": visual if query else "graphic",
                 "image_query": query, "status": "draft", "review_note": None,
                 "ig_caption": _paragraphs(draft.get("ig_caption", ""), IG_CAPTION_MAX) or None,
-                "x_post": _x_post(draft.get("x_post", ""), a["fresh"]) or None}
+                "x_post": _x_post(draft.get("x_post", "")) or None,
+                "x_hashtag": next(iter(normalize_hashtags([draft.get("x_hashtag") or ""], source_text,
+                                                          a["source_name"])), None)}
 
     # --- verification -------------------------------------------------------
     def _verify(self, keys: dict, drafts: dict[str, dict]) -> dict[str, str]:

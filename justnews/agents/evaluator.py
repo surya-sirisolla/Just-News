@@ -36,15 +36,17 @@ FUZZY_DUPLICATE_THRESHOLD = 0.6
 HISTORY_LIMIT = 80
 
 SYSTEM_PROMPT = """You are the News Evaluator for "Just News", a social media account that posts
-important, credible, timely stories in Technology, AI, Business, Politics and World News for a broad,
-international audience. Evaluate each article from its headline, description, publisher and age.
+important, credible, timely stories for a broad audience in India, especially South India: Indian and
+South Indian news first, plus Business, Technology, AI and major World news. Evaluate each article from
+its headline, description, publisher and age.
 
 Score each article with integers 0-100:
 - relevance: newsworthiness and importance within its category. High for significant developments
   (major launches, research breakthroughs, policy/regulation, elections, large deals, earnings that move
   markets, conflicts, disasters). Low for minor updates, opinion/analysis columns, listicles, how-tos,
   reviews, evergreen features, celebrity gossip or hyper-local news.
-- audience_interest: how likely a broad social audience is to care, click and share.
+- audience_interest: how likely a broad social audience in India is to care, click and share. World
+  news scores high only when it matters to Indian readers too.
 - credibility: trustworthiness of the publisher as a news source (established outlets high; unknown
   blogs, press releases, content farms, tabloids low).
 
@@ -153,7 +155,9 @@ class NewsEvaluatorAgent:
         self.llm = llm or make_llm_client(settings)
         self.last_error: str | None = None
 
-    def run(self, run_id: str) -> EvaluationResult:
+    def run(self, run_id: str, fresh_look: bool = False) -> EvaluationResult:
+        """`fresh_look` (on-demand research): score every article, including ones seen in earlier
+        runs, and don't reject stories as covered before; the owner asked for this topic."""
         articles = self.db.articles_for_run(run_id)
         log.info("Run %s: evaluating %d discovered articles with %s", run_id, len(articles), self.llm.model)
         now = datetime.now(timezone.utc)
@@ -162,7 +166,7 @@ class NewsEvaluatorAgent:
         evaluations: dict[str, Evaluation] = {}
         fresh: list[Article] = []
         for a in articles:
-            prior = self.db.prior_evaluation(a.id, run_id)
+            prior = None if fresh_look else self.db.prior_evaluation(a.id, run_id)
             if prior:
                 evaluations[a.id] = Evaluation(
                     a.id, 0, known_credibility(a.source_name) or 0, freshness_score(a.published_at, now), 0, 0,
@@ -173,7 +177,7 @@ class NewsEvaluatorAgent:
         log.info("  %d already evaluated in earlier runs, %d need scoring", len(articles) - len(fresh), len(fresh))
 
         # 2. Scoring, with earlier-run recommendations as context for "previously covered".
-        history = self.db.recent_history(run_id, self.settings.history_days)[:HISTORY_LIMIT]
+        history = [] if fresh_look else self.db.recent_history(run_id, self.settings.history_days)[:HISTORY_LIMIT]
         history_ids = {f"H{i + 1}": row for i, row in enumerate(history)}
         keys = {f"A{i + 1}": a for i, a in enumerate(self._order_by_similarity(fresh))}
         if hasattr(self.llm, "score_articles"):

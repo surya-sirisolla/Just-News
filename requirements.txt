@@ -1,6 +1,7 @@
 anthropic==2.3.0
 boto3==1.43.123
 feedparser==6.0.14
+imageio-ffmpeg==0.6.0
 neonize==0.10.0
 pillow==13.0.0
 requests==2.34.2
