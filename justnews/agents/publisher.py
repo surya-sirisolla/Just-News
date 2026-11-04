@@ -38,7 +38,7 @@ URL_LIFETIME = 3600
 POLL_SECONDS, POLL_ATTEMPTS = 3, 20
 TIMEOUT = 60
 MAX_ATTEMPTS = 3  # a failed post is retried in later cycles up to this many times
-RETRY_HOURS = 6   # ...but only while the news is fresh; older failures are left alone
+RETRY_HOURS = 2   # ...but only while the news is fresh; older failures are left alone
 
 
 class PublishError(Exception):
@@ -168,7 +168,9 @@ class Publisher:
                 media_id, link = self._publish_one(run_id, p)
             except PublishError as exc:
                 log.error("  %s post failed for %r: %s", self.label, p["headline"][:60], exc)
-                self.db.save_publication(aid, self.platform, "failed", error=str(exc))
+                # A token, permission or credits problem is "blocked": never retried by itself, so a
+                # story approved hours ago doesn't go out late once the account is fixed.
+                self.db.save_publication(aid, self.platform, "blocked" if exc.fatal else "failed", error=str(exc))
                 result.failed.append((aid, str(exc)))
                 if exc.fatal:
                     result.failed += [(a, "not attempted after a token/permission error")

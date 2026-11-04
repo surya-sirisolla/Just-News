@@ -186,6 +186,15 @@ class PublisherTests(unittest.TestCase):
             self.db.save_publication(self.ids[1], "instagram", "failed", error="boom")
         self.assertEqual(self.db.failed_publications("instagram", 3, 6), [])
 
+    def test_account_problems_are_blocked_not_retried(self):
+        self.publisher(FakeGraph(fail=("/media", 190))).publish("r1", [self.ids[1]])  # bad token
+        self.db.set_post_approval([self.ids[1]], "approved")
+        self.assertEqual(self.db.publication(self.ids[1], "instagram")["status"], "blocked")
+        self.assertEqual(self.db.failed_publications("instagram", 3, 2), [])
+        graph = FakeGraph()
+        self.assertEqual(self.publisher(graph).retry_failed().posted, [])  # fixed token: still not posted late
+        self.assertEqual(graph.live, [])
+
     def test_old_failures_are_not_retried(self):
         self.db.set_post_approval([self.ids[1]], "approved")
         self.db.save_publication(self.ids[1], "instagram", "failed", error="no credits")

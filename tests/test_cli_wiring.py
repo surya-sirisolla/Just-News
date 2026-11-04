@@ -132,7 +132,8 @@ class WiringTests(unittest.TestCase):
                  x=fake_publisher("x", "X", self.calls, retry=found), **IG_KEYS, **X_KEYS, whatsapp_owner=OWNER)
         cli.retry_failed_posts(self.db)
         self.assertEqual(self.calls, [("Instagram", "retry"), ("X", "retry")])  # a crash doesn't stop X
-        self.assertEqual(self.outbox(), ["Update: 1 earlier post is now confirmed on X ✅\nhttps://x.com/i/status/1"])
+        self.assertEqual(self.outbox(), ["Update: 1 approved story that failed earlier is now on X ✅\n"
+                                         "• Headline 1: https://x.com/i/status/1"])
 
     def test_publish_command_posts_only_approved_stories_with_templates(self):
         self.use(**IG_KEYS, **X_KEYS)

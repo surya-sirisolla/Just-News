@@ -25,6 +25,7 @@ from typing import Callable
 from .agents.publisher import field_of, instagram_caption, source_line
 from .agents.x_publisher import x_text
 from .config import Settings
+from .quiet import local_time, quiet_until
 from .db import Database
 from .assistant import fallback
 from .whatsapp import MAX_TEXT, Incoming
@@ -111,9 +112,12 @@ class ApprovalService:
         blocks = [self._format_item(n, posts[aid]) for n, aid in items.items() if aid in posts]
         local = datetime.now(ZoneInfo(self.settings.timezone)).strftime("%-I:%M %p")
         header = f"📰 *Just News* · {local} – {len(blocks)} new stories"
+        following = datetime.now(timezone.utc) + timedelta(minutes=self.settings.cycle_minutes)
+        quiet_end = quiet_until(self.settings, following)
+        when = (f"at {local_time(self.settings, quiet_end)} (quiet hours until then)" if quiet_end
+                else f"in about {_duration(self.settings.cycle_minutes)}")
         footer = (f"Reply with the numbers to post, e.g. *1 3* or *1-3*, or *all* / *none*. "
-                  f"If you skip this list, it's ignored and the next one comes in about "
-                  f"{_duration(self.settings.cycle_minutes)}.")
+                  f"If you skip this list, it's ignored and the next one comes {when}.")
         for text in _chunks([header] + blocks, footer):
             self._send(text)
         self.db.set_approval_status(request_id, "sent")

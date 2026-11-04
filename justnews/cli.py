@@ -32,6 +32,7 @@ from .agents.evaluator import NewsEvaluatorAgent
 from .agents.images import ImageDesignerAgent
 from .agents.publisher import InstagramPublisher, Publisher
 from .agents.strategist import StrategistAgent
+from .quiet import local_time, quiet_until
 from .agents.x_publisher import XPublisher
 from .approval import ApprovalService
 from .assistant import Assistant
@@ -218,11 +219,11 @@ def retry_failed_posts(db: Database) -> None:
             log.exception("Retrying failed %s posts failed", publisher.label)
             continue
         if result.posted and settings.whatsapp_enabled:
-            links = "\n".join(link for _, link in result.posted if link)
             n = len(result.posted)
+            lines = "\n".join(f"• {db.post_headline(aid) or 'Story'}: {link or '(posted)'}" for aid, link in result.posted)
             OutboxClient(db).send_text(settings.whatsapp_owner,
-                                       f"Update: {n} earlier post{'s are' if n != 1 else ' is'} "
-                                       f"now confirmed on {publisher.label} ✅\n{links}")
+                                       f"Update: {n} approved stor{'ies' if n != 1 else 'y'} that failed earlier "
+                                       f"{'are' if n != 1 else 'is'} now on {publisher.label} ✅\n{lines}")
 
 
 def run_cycle(db: Database, run_id: str | None = None) -> str:
@@ -251,6 +252,10 @@ def cmd_run(db: Database, args) -> str:
     return cmd_report(db, args)
 
 
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def seconds_until_due(db: Database, every_minutes: int) -> float:
     """Time left until the next cycle, counted from the last one, so a restart or deploy doesn't
     send an extra shortlist."""
@@ -269,6 +274,11 @@ def scheduler(every_minutes: int, stop: threading.Event) -> None:
         log.info("Next news cycle in %.0f minutes (the last one ran recently)", wait / 60)
         stop.wait(wait)
     while not stop.is_set():
+        until = quiet_until(settings, utcnow())
+        if until:
+            log.info("Quiet hours: no news cycles until %s", local_time(settings, until))
+            stop.wait(max(60.0, (until - utcnow()).total_seconds()))
+            continue
         started = time.monotonic()
         try:
             run_id = run_cycle(db)

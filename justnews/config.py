@@ -115,6 +115,8 @@ class Settings:
     # `serve` runs a news cycle this often; an unanswered shortlist is replaced by the next one.
     cycle_minutes: int = field(default_factory=lambda: _int("JUSTNEWS_CYCLE_MINUTES", 60))
     timezone: str = field(default_factory=lambda: os.getenv("JUSTNEWS_TIMEZONE", "Asia/Kolkata"))
+    # No news cycles, shortlists or retries between these local hours ("23-7"; "off" disables).
+    quiet_hours: str = field(default_factory=lambda: os.getenv("JUSTNEWS_QUIET_HOURS", "23-7"))
     # Free-tier Gemini models for chatting with the owner, fastest first (replies should feel instant).
     gemini_chat_models: list[str] = field(default_factory=lambda: _list(
         "GEMINI_CHAT_MODELS", ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"]))
@@ -127,7 +129,7 @@ class Settings:
     s3_bucket: str = field(default_factory=lambda: os.getenv("JUSTNEWS_S3_BUCKET", "").strip())
     aws_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "ap-south-1"))
     # Our own cap, well under Instagram's 100 API posts per 24 hours.
-    max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 10))
+    max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 20))
 
     # X (API v2) with OAuth 1.0a keys for the posting account itself. Posting needs Pay-Per-Use
     # credits on console.x.com. Publishing is on when all four are set.

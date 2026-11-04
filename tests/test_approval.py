@@ -27,7 +27,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.settings = replace(Settings(), db_path=self.root / "t.db", whatsapp_owner=OWNER, max_posts_per_run=10)
+        self.settings = replace(Settings(), db_path=self.root / "t.db", whatsapp_owner=OWNER, max_posts_per_run=10,
+                                quiet_hours="off")
         self.db = Database(self.settings.db_path)
         self.designed = []
         self.service = ApprovalService(self.settings, self.db, OutboxClient(self.db), self.designer)

@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
 CREATE TABLE IF NOT EXISTS publications (
     article_id    TEXT NOT NULL REFERENCES posts(article_id),
     platform      TEXT NOT NULL,      -- "instagram" or "x"
-    status        TEXT NOT NULL,      -- published / failed
+    status        TEXT NOT NULL,      -- published / failed (retried) / blocked (account problem: not retried)
     media_id      TEXT,
     permalink     TEXT,
     error         TEXT,
@@ -443,6 +443,10 @@ class Database:
             c.execute("INSERT OR REPLACE INTO publications(article_id, platform, status, media_id, permalink, error, "
                       "updated_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                       (article_id, platform, status, media_id, permalink, error, _now(), attempts))
+
+    def post_headline(self, article_id: str) -> str | None:
+        row = self.conn.execute("SELECT headline FROM posts WHERE article_id = ?", (article_id,)).fetchone()
+        return row[0] if row else None
 
     def published_platforms(self, article_id: str) -> list[str]:
         return [r[0] for r in self.conn.execute(

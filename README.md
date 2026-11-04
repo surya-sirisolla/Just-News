@@ -259,7 +259,7 @@ post links, and `python -m justnews publish [RUN_ID]` posts approved templates b
    presigned link. Then `POST /<IG_ID>/media` creates the post, the publisher waits for
    `FINISHED`, and `POST /<IG_ID>/media_publish` publishes it. The permalink is saved and the S3
    copy deleted.
-5. **Safeguards:** each story is posted once, at most `JUSTNEWS_MAX_POSTS_PER_DAY` (10) per day
+5. **Safeguards:** each story is posted once, at most `JUSTNEWS_MAX_POSTS_PER_DAY` (20) per day
    (Instagram allows 100). The caption includes the photo credit for licensed photos.
 
 ### X / Twitter (built: `justnews/agents/x_publisher.py`)
