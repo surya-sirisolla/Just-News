@@ -140,6 +140,8 @@ class Settings:
     aws_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "ap-south-1"))
     # Our own cap, well under Instagram's 100 API posts per 24 hours. A carousel counts as one post.
     max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_DAY", 20))
+    # X's own cap: a new account posting a lot looks like spam to X's ranking, so fewer, better posts.
+    x_max_posts_per_day: int = field(default_factory=lambda: _int("JUSTNEWS_X_MAX_POSTS_PER_DAY", 8))
     # Two or more approved stories go to Instagram as one swipeable carousel (cover, a slide per story, close).
     instagram_carousel: bool = field(default_factory=lambda: os.getenv("JUSTNEWS_INSTAGRAM_CAROUSEL", "true").lower() == "true")
     # X gets one post per story, spaced out like a newsroom feed; posts still waiting after

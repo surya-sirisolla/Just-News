@@ -169,8 +169,10 @@ def code_notes(draft: dict, publisher: str = "") -> list[str]:
         if len(x) > X_POST_MAX:
             notes.append(f"X: {len(x)} characters; keep it under 240.")
         if re.match(r"\s*according to\b", x, re.I):
-            notes.append("X: don't open with 'According to'; state the news and end with '<publisher> reports.'")
-        if ig and difflib.SequenceMatcher(None, x.lower(), ig.split("\n", 1)[0].lower()).ratio() > 0.8:
+            notes.append("X: don't open with 'According to'; state the news (the source line is added after).")
+        if "\n" not in x:
+            notes.append("X: write the news line, a blank line, then one short detail line.")
+        if ig and difflib.SequenceMatcher(None, x.split("\n", 1)[0].lower(), ig.split("\n", 1)[0].lower()).ratio() > 0.8:
             notes.append("X: it repeats the Instagram hook; write it as a short wire-style alert instead.")
     return notes
 

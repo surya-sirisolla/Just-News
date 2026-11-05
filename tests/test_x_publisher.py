@@ -67,6 +67,14 @@ def post_row(**kw):
 
 
 class TextTests(unittest.TestCase):
+    def test_x_has_its_own_smaller_daily_cap(self):
+        from justnews.config import Settings
+        from justnews.agents.publisher import InstagramPublisher
+        s = Settings()
+        self.assertEqual((s.x_max_posts_per_day, s.max_posts_per_day), (8, 20))
+        self.assertEqual(XPublisher.daily_cap.fget(NS(settings=s)), 8)
+        self.assertEqual(InstagramPublisher.daily_cap.fget(NS(settings=s)), 20)
+
     def test_text_has_source_and_no_links(self):
         text = x_text(post_row(caption="Details at https://example.com/x and www.example.org today."))
         self.assertIn("Source: Reuters", text)
@@ -113,7 +121,7 @@ class XPublisherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.settings = replace(Settings(), db_path=self.root / "t.db", max_posts_per_day=10, whatsapp_owner=OWNER,
+        self.settings = replace(Settings(), db_path=self.root / "t.db", x_max_posts_per_day=10, whatsapp_owner=OWNER,
                                 x_api_key="ck", x_api_secret="cs", x_access_token="42-tok", x_access_token_secret="ts",
                                 instagram_token="")
         self.db = Database(self.settings.db_path)
@@ -183,7 +191,7 @@ class XPublisherTests(unittest.TestCase):
         self.assertEqual(self.db.failed_publications("x", 3, 2), [])  # and not retried later
 
     def test_daily_limit_applies_to_the_queue(self):
-        self.settings = replace(self.settings, max_posts_per_day=1)
+        self.settings = replace(self.settings, x_max_posts_per_day=1)
         result = self.publisher().publish("r1", self.ids[:2])
         self.assertEqual(len(result.posted), 1)
         self.assertIn("daily limit", result.failed[0][1])

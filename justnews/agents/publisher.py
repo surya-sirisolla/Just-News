@@ -42,6 +42,7 @@ log = logging.getLogger("justnews.publisher")
 PLATFORM = "instagram"
 CAPTION_MAX = 2200
 HASHTAG_MAX = 5  # Instagram's own limit per post
+IG_HOOK_MAX = 120  # longer first lines are paragraphs, not hooks: carousels list the headline instead
 INSIGHT_NAMES = {"reach": "reach", "saved": "saves", "shares": "shares", "views": "views"}
 URL_LIFETIME = 3600
 POLL_SECONDS, POLL_ATTEMPTS = 3, 20
@@ -94,13 +95,14 @@ def source_line(p) -> str:
 
 
 def instagram_caption(p) -> str:
-    """The Instagram version (or headline + caption for older posts), hashtags, source and (for
-    licensed photos) the photo credit."""
+    """The Instagram version (or headline + caption for older posts), the source, (for licensed
+    photos) the photo credit, and the hashtags last."""
     body = field_of(p, "ig_caption") or "\n\n".join(x for x in (p["headline"], p["caption"]) if x)
     tags = json.loads(p["hashtags"])[:HASHTAG_MAX]
-    parts = [body, " ".join(tags), source_line(p)]
+    parts = [body, source_line(p)]
     if p["image_kind"] == "photo" and p["image_credit"]:
         parts.append(p["image_credit"])  # CC BY/BY-SA require attribution
+    parts.append(" ".join(tags))
     text = "\n\n".join(x for x in parts if x)
     return text if len(text) <= CAPTION_MAX else text[: CAPTION_MAX - 1] + "…"
 
@@ -119,16 +121,23 @@ def merge_hashtags(tag_lists: list[list[str]], limit: int = HASHTAG_MAX) -> list
     return [names[k] for k in ranked[:limit]]
 
 
+def ig_hook(p) -> str:
+    """The Instagram caption's first line (its everyday-words hook), else the headline."""
+    hook = (field_of(p, "ig_caption") or "").split("\n", 1)[0].strip()
+    return hook if 0 < len(hook) <= IG_HOOK_MAX else p["headline"]
+
+
 def carousel_caption(posts: list) -> str:
-    """The numbered headlines, shared hashtags, sources and (for licensed photos) the photo credits."""
-    headlines = "\n".join(f"{i}. {p['headline']}" for i, p in enumerate(posts, 1))
+    """The stories' hooks, numbered, then shared hashtags, sources and (for licensed photos) the
+    photo credits."""
+    headlines = "\n".join(f"{i}. {ig_hook(p)}" for i, p in enumerate(posts, 1))
     tags = merge_hashtags([json.loads(p["hashtags"]) for p in posts])
     sources = list(dict.fromkeys(field_of(p, "source_name") or p["attribution"] for p in posts))
     credits = [p["image_credit"] for p in posts if p["image_kind"] == "photo" and p["image_credit"]]
-    parts = [f"{len(posts)} stories this hour. Swipe through:", headlines, " ".join(tags),
-             "Sources: " + ", ".join(sources)]
+    parts = [f"{len(posts)} stories this hour. Swipe through:", headlines, "Sources: " + ", ".join(sources)]
     if credits:
         parts.append("Photos: " + "; ".join(dict.fromkeys(credits)))  # CC BY/BY-SA require attribution
+    parts.append(" ".join(tags))
     text = "\n\n".join(x for x in parts if x)
     return text if len(text) <= CAPTION_MAX else text[: CAPTION_MAX - 1] + "…"
 
@@ -202,9 +211,13 @@ class Publisher:
     def _find_live(self, p, recent: list[dict] | None = None) -> tuple[str, str] | None:
         raise NotImplementedError
 
+    @property
+    def daily_cap(self) -> int:
+        return self.settings.max_posts_per_day
+
     def _budget(self, result: PublishResult, article_ids: list[str]) -> int | None:
         """Posts left today (our cap and the platform's own quota); None when the quota check fails."""
-        budget = self.settings.max_posts_per_day - self.db.published_since(self.platform, 24)
+        budget = self.daily_cap - self.db.published_since(self.platform, 24)
         try:
             quota = self.remaining_quota()
         except PublishError as exc:
@@ -253,7 +266,7 @@ class Publisher:
             if not self._ready(aid, posts.get(aid), result):
                 continue
             if budget <= 0:
-                result.skipped.append((aid, f"daily limit of {self.settings.max_posts_per_day} posts reached"))
+                result.skipped.append((aid, f"daily limit of {self.daily_cap} posts reached"))
                 continue
             if not self._post(run_id, posts[aid], result):
                 result.failed += [(a, "not attempted after a token/permission error") for a in article_ids[i + 1:]]
@@ -413,7 +426,7 @@ class InstagramPublisher(Publisher):
         groups = story_groups(ready, carousel.MAX_STORIES)
         for g, group in enumerate(groups):
             if budget <= 0:
-                result.skipped += [(a, f"daily limit of {self.settings.max_posts_per_day} posts reached") for a in group]
+                result.skipped += [(a, f"daily limit of {self.daily_cap} posts reached") for a in group]
                 continue
             if len(group) == 1:
                 ok = self._post(run_id, posts[group[0]], result)

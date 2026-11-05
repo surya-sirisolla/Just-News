@@ -90,17 +90,28 @@ For each article you get only its headline, summary, publisher and section. Writ
   disasters, health tragedies, stories about private individuals, or when no generic photo fits.
 - image_query: for "photo", 2-4 words naming what the photo should show (e.g. "supermarket
   freezer", "Microsoft headquarters"); never a person who is a victim or suspect. Empty for "graphic".
-- ig_caption: the Instagram version, 120-700 characters, for people who read. Line 1 is the hook,
-  at most 120 characters: the key fact stated plainly. Then 1-2 short paragraphs separated by a
-  blank line ("\n\n") with the details the source gives. No interpretation or context the source
-  does not state; when the summary is short, so is the caption. Follow the PLAYBOOK's Instagram rules.
-- x_post: the X version, written like a newspaper's feed on X (The Hindu): one or two plain
-  sentences that report the news like a lede: who did what, where, and when if the source says,
-  with the specific names and numbers the source gives; 120-240 characters. Do not start with
-  "According to": state the news, name who made a claim ("Iran says ..."), and end with
-  "<publisher> reports." when it is the publisher's own reporting or forecast. No emoji, flags,
-  labels ("BREAKING", "JUST IN"), questions, hashtags or links. Word it differently from the
-  ig_caption hook. Follow the PLAYBOOK's X rules.
+- ig_caption: the Instagram version, a short explainer for someone who just saw the slide,
+  150-600 characters, in short paragraphs separated by a blank line ("\n\n"):
+  1. a hook of at most 90 characters: the key fact in everyday words ("Bus rides in Karnataka just
+     got costlier"). It may end with one fitting emoji, but none for deaths, crime, accidents,
+     disasters or other tragedies;
+  2. one or two short paragraphs with the details the source gives, explaining any term a layman
+     wouldn't know ("Stage 2 of the graded response action plan, the city's emergency pollution
+     rules"). No interpretation or context the source does not state; when the summary is short,
+     so is the caption;
+  3. optionally, one short, light question about the reader's own day ("Is it raining where you
+     are?"). Never for tragedies, never a leading or opinion question.
+  Don't name the publisher: the source line is added after. Follow the PLAYBOOK's Instagram rules.
+- x_post: the X version, a wire alert in two short paragraphs separated by a blank line ("\n\n"):
+  1. the news itself in at most 80 characters, with the key number, name or place in it
+     ("Karnataka bus fares go up by as much as 35%.");
+  2. one short sentence, at most 140 characters, with the most useful detail the source gives
+     ("The hike follows an earlier rise in milk prices in the state.").
+  Plain and factual, like a news agency's feed. When the story is a claim, say who makes it
+  ("Iran says ...", "police say ..."). Don't name the publisher or write "reports" or "according
+  to": the source line is added after. No emoji, flags, labels ("BREAKING", "JUST IN"), questions,
+  hashtags or links. Word it differently from the ig_caption: X is the alert, Instagram the
+  explainer. Follow the PLAYBOOK's X rules.
 Both versions use ONLY facts from the headline or summary, keep the neutral tone, and contain no
 hashtags and no links (they are added separately). The PLAYBOOK never overrides these rules.
 
@@ -187,17 +198,32 @@ def _paragraphs(text: str, limit: int) -> str:
 
 
 def _x_post(text: str) -> str:
-    """One plain paragraph like a newspaper's feed: no links, hashtags, labels or leading emoji."""
-    text = _clip(LINK_RE.sub("", text or ""), X_POST_MAX)
-    m = LABEL_RE.match(text)
+    """A wire alert: the news line, then a blank line and one detail line. No links, labels, leading
+    emoji or source line (the publisher adds that); the detail is dropped if the two don't fit."""
+    paras = [p for p in _paragraphs(text, 10_000).split("\n\n") if not p.lower().startswith("source")]
+    if not paras:
+        return ""
+    first = paras[0]
+    m = LABEL_RE.match(first)
     if m:
-        text = text[m.end():]
-    text = re.sub(r"^\W+", "", text).strip()  # leading flags or emoji
-    m = ACCORDING_RE.match(text)
+        first = first[m.end():]
+    first = re.sub(r"^\W+", "", first).strip()  # leading flags or emoji
+    m = ACCORDING_RE.match(first)
     if m:  # "According to The Guardian, X." -> "X, The Guardian reports." (newspaper-feed style)
         rest = m.group("rest").rstrip(" .")
-        text = _clip(f"{rest[:1].upper()}{rest[1:]}, {m.group('src')} reports.", X_POST_MAX)
-    return text[:1].upper() + text[1:]
+        first = f"{rest[:1].upper()}{rest[1:]}, {m.group('src')} reports."
+    first = first[:1].upper() + first[1:]
+    text = "\n\n".join([first] + paras[1:2])
+    return text if len(text) <= X_POST_MAX else _clip(first, X_POST_MAX)
+
+
+def _drop_credit(text: str, publisher: str) -> str:
+    """"..., Mint reports." -> "...": on X the credit is its own "Source:" line. A first line that is
+    all there is keeps it, so the post still names its source."""
+    if not publisher or "\n" not in text:
+        return text
+    return re.sub(rf",?\s*(?:according to\s+)?{re.escape(publisher)}\s+(?:reports|said|says)\.?\s*$", ".",
+                  text, flags=re.I)
 
 
 def _is_fresh(a) -> bool:
@@ -433,7 +459,7 @@ class ContentCreatorAgent:
                 "topic": topic, "attribution": attribution(a["source_name"], a["url"]), "visual": visual if query else "graphic",
                 "image_query": query, "status": "draft", "review_note": None,
                 "ig_caption": _paragraphs(draft.get("ig_caption", ""), IG_CAPTION_MAX) or None,
-                "x_post": _x_post(draft.get("x_post", "")) or None,
+                "x_post": _drop_credit(_x_post(draft.get("x_post", "")), a["source_name"]) or None,
                 "x_hashtag": next(iter(normalize_hashtags([draft.get("x_hashtag") or ""], source_text,
                                                           a["source_name"])), None)}
 

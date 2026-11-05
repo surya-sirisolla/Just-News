@@ -117,6 +117,10 @@ class XPublisher(Publisher):
     platform = "x"
     label = "X"
 
+    @property
+    def daily_cap(self) -> int:
+        return self.settings.x_max_posts_per_day
+
     def __init__(self, settings: Settings, db: Database, session=None, sleep=time.sleep,
                  spacing: float | None = None, clock=None):
         super().__init__(settings, db, sleep)
@@ -281,7 +285,7 @@ class XPublisher(Publisher):
                if datetime.fromisoformat(r["scheduled_at"]) <= now]
         if not due:
             return []
-        budget = self.settings.max_posts_per_day - self.db.published_since(self.platform, 24)
+        budget = self.daily_cap - self.db.published_since(self.platform, 24)
         stop = False
         for r in due:
             aid = r["article_id"]
@@ -294,7 +298,7 @@ class XPublisher(Publisher):
                 continue
             if budget <= 0:
                 self.db.save_publication(aid, self.platform, "skipped",
-                                         error=f"daily limit of {self.settings.max_posts_per_day} posts reached")
+                                         error=f"daily limit of {self.daily_cap} posts reached")
                 continue
             p = next((x for x in self.db.posts_for_run(r["run_id"]) if x["article_id"] == aid), None)
             if p is None or not p["image_path"] or not Path(p["image_path"]).exists():

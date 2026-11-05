@@ -66,7 +66,7 @@ class FakePlatform:
 def draft(k, **kw):
     d = {"id": k, "headline": f"Headline {k}", "caption": f"Caption {k}.", "hashtags": ["World", "News", "Story"],
          "image_text": "Text", "visual": "graphic", "image_query": "",
-         "ig_caption": f"Hook for {k}.\n\nWhat happened.\n\nWould you switch?", "x_post": f"🇮🇳 Wire alert {k}"}
+         "ig_caption": f"Hook for {k}.\n\nWhat happened.\n\nWould you switch?", "x_post": f"🇮🇳 Wire alert {k}\n\nOne detail."}
     return {**d, **kw}
 
 
@@ -126,9 +126,32 @@ class TextTests(unittest.TestCase):
              "x_post": "Apple opened its first store in Pune on Friday, its third in India."}
         ig, x = instagram_caption(p), x_text(p)
         self.assertTrue(ig.startswith("Apple opened its first store in Pune.\n\n"))
-        self.assertIn("#Apple #India #Retail", ig)
-        self.assertTrue(ig.endswith("Source: BBC News"))  # the long Google News link is dropped
+        self.assertIn("Source: BBC News", ig)  # the long Google News link is dropped
+        self.assertTrue(ig.endswith("Source: BBC News\n\n#Apple #India #Retail"))  # the hashtags come last
         self.assertEqual(x, "Apple opened its first store in Pune on Friday, its third in India.\n\nSource: BBC News")
+
+    def test_x_post_is_a_news_line_and_one_detail_line(self):
+        self.assertEqual(_x_post("Karnataka bus fares go up by as much as 35%.\n\nThe hike follows a milk price rise."
+                                 "\n\nA third paragraph.\n\nSource: BusinessLine"),
+                         "Karnataka bus fares go up by as much as 35%.\n\nThe hike follows a milk price rise.")
+        self.assertEqual(_x_post("JUST IN: Fares rise.\n" + "detail " * 40), "Fares rise.")  # too long: the news line alone
+
+    def test_x_credit_moves_to_its_own_source_line(self):
+        from justnews.agents.content import _drop_credit
+        self.assertEqual(_drop_credit("Fares rise.\n\nIt follows a milk price rise, BusinessLine reports.", "BusinessLine"),
+                         "Fares rise.\n\nIt follows a milk price rise.")
+        self.assertEqual(_drop_credit("Fares rise, BusinessLine reports.", "BusinessLine"),
+                         "Fares rise, BusinessLine reports.")  # a single line keeps its credit
+
+    def test_carousel_lists_the_instagram_hooks(self):
+        from justnews.agents.publisher import carousel_caption
+        base = {"hashtags": json.dumps(["#Delhi"]), "attribution": "Source: Mint", "image_kind": "graphic",
+                "image_credit": None, "source_name": "Mint", "url": "https://mint.com/a"}
+        posts = [{**base, "headline": "Delhi AQI hits 605", "ig_caption": "Delhi is breathing air at AQI 605 😷\n\nMore."},
+                 {**base, "headline": "Rain alert in the south", "ig_caption": None}]
+        caption = carousel_caption(posts)
+        self.assertIn("1. Delhi is breathing air at AQI 605 😷\n2. Rain alert in the south", caption)
+        self.assertTrue(caption.endswith("Sources: Mint\n\n#Delhi"))
 
     def test_code_notes(self):
         self.assertEqual(code_notes(draft("P1")), [])
@@ -139,7 +162,8 @@ class TextTests(unittest.TestCase):
         notes = code_notes(draft("P1", ig_caption="Flights were checked according to BBC News.\n\nMore.",
                                  x_post="According to BBC News, planes were checked"), "BBC News")
         self.assertEqual(notes, ["Instagram: don't end the hook with the attribution; move it to the next paragraph.",
-                                 "X: don't open with 'According to'; state the news and end with '<publisher> reports.'"])
+                                 "X: don't open with 'According to'; state the news (the source line is added after).",
+                                 "X: write the news line, a blank line, then one short detail line."])
 
     def test_source_line_drops_tracking_parameters(self):
         from justnews.agents.publisher import source_line
