@@ -215,9 +215,15 @@ class Publisher:
     def daily_cap(self) -> int:
         return self.settings.max_posts_per_day
 
+    def posted_today(self, now: datetime | None = None) -> int:
+        """Posts on this platform since midnight in the owner's time zone: the daily cap resets then,
+        so yesterday evening's posts don't hold back this morning's."""
+        local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(self.settings.timezone))
+        return self.db.published_since(self.platform, local.replace(hour=0, minute=0, second=0, microsecond=0))
+
     def _budget(self, result: PublishResult, article_ids: list[str]) -> int | None:
         """Posts left today (our cap and the platform's own quota); None when the quota check fails."""
-        budget = self.daily_cap - self.db.published_since(self.platform, 24)
+        budget = self.daily_cap - self.posted_today()
         try:
             quota = self.remaining_quota()
         except PublishError as exc:

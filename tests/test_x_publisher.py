@@ -196,6 +196,18 @@ class XPublisherTests(unittest.TestCase):
         self.assertEqual(len(result.posted), 1)
         self.assertIn("daily limit", result.failed[0][1])
 
+    def test_daily_limit_resets_at_midnight_not_after_24_hours(self):
+        pub = XPublisher(replace(self.settings, timezone="Asia/Kolkata"), self.db)
+        ids = [r["id"] for r in self.db.conn.execute("SELECT id FROM articles")]
+        for aid, at in zip(ids, ["2026-11-04T16:00:00+00:00",    # 9:30 PM IST yesterday
+                                 "2026-11-04T18:45:00+00:00",    # 12:15 AM IST today
+                                 "2026-11-05T05:00:00+00:00"]):  # 10:30 AM IST today
+            self.db.conn.execute("INSERT INTO publications(article_id, platform, status, updated_at) "
+                                 "VALUES (?, 'x', 'published', ?)", (aid, at))
+        self.db.conn.commit()
+        noon = datetime(2026, 11, 5, 7, 48, tzinfo=timezone.utc)  # 1:18 PM IST
+        self.assertEqual(pub.posted_today(noon), 2)  # yesterday evening's post no longer counts
+
     def test_a_photo_goes_up_with_the_post_and_a_text_template_does_not(self):
         result = self.publisher().publish("r1", self.ids[:2])
         self.assertEqual([link for _, link in result.posted],

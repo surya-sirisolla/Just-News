@@ -543,10 +543,10 @@ class Database:
                  AND pub.updated_at >= ?""",
             (platform, max_attempts, since)).fetchall()
 
-    def published_since(self, platform: str, hours: float) -> int:
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+    def published_since(self, platform: str, since: datetime) -> int:
+        start = since.astimezone(timezone.utc).isoformat(timespec="seconds")
         return self.conn.execute("SELECT COUNT(*) FROM publications WHERE platform = ? AND status = 'published' "
-                                 "AND updated_at >= ?", (platform, since)).fetchone()[0]
+                                 "AND updated_at >= ?", (platform, start)).fetchone()[0]
 
     # --- strategist: engagement, benchmarks, playbook, discussion --------------------
     def published_posts(self, platform: str, days: float) -> list[sqlite3.Row]:

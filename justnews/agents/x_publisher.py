@@ -285,7 +285,7 @@ class XPublisher(Publisher):
                if datetime.fromisoformat(r["scheduled_at"]) <= now]
         if not due:
             return []
-        budget = self.daily_cap - self.db.published_since(self.platform, 24)
+        budget = self.daily_cap - self.posted_today(now)
         stop = False
         for r in due:
             aid = r["article_id"]
