@@ -339,6 +339,10 @@ posts it to Instagram as a Reel, then sends the link on WhatsApp.
 - **One card per story, about 8 seconds:** small logo and "1 / 5" at the top, then the category,
   the headline, a modest photo card with a slow zoom (licensed photos only), the key facts one by
   one and the source. Each card fades into the next card's empty background, then its parts rise in.
+- **Quiet background music of our own:** four instrumentals synthesized by `scripts/make_music.py`
+  (no samples, so no licence or copyright claim), stored in `justnews/assets/music/`. calm-keys by
+  default (`JUSTNEWS_RECAP_MUSIC`); `rotate` uses a different track each day, `off` is silence. It
+  fades in, and out over the last 2.5 seconds.
 - **Order by attention, so it changes with the day:** 40% audience interest (Jev's score from
   evaluation) + 30% importance + today's topic heat (how many of the day's headlines share the
   story's topic, relative to the hottest topic) + India +6 / South India +3. At least one South

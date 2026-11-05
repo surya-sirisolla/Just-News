@@ -193,7 +193,8 @@ class RecapTests(unittest.TestCase):
         rows = self.db.published_between(*recap.day_bounds(self.day, "Asia/Kolkata"))
         out = self.root / "recap.mp4"
         with mock.patch.multiple(recap, INTRO=0.4, STORY_MIN=0.4, STORY_MAX=0.4, OUTRO=0.4, FADE=0.1):
-            cover = recap.render(rows, "4 Nov 2026", "just_newzzzz", "Just News", Fonts(), out)
+            cover = recap.render(rows, "4 Nov 2026", "just_newzzzz", "Just News", Fonts(), out,
+                                 music=recap.MUSIC / "calm-keys.m4a")
         self.assertEqual(cover.size, (1080, 1920))  # the cover image stays full size
         import imageio_ffmpeg
         probe = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-i", str(out)], capture_output=True, text=True).stderr
@@ -207,6 +208,17 @@ class RecapTests(unittest.TestCase):
         for flag in ("-threads 1", "-thread_queue_size 2", "rc-lookahead=5", "-t 37.00", "-s 720x1280"):
             self.assertIn(flag, joined)
         self.assertNotIn("-shortest", cmd)
+
+    def test_music_rotates_by_day_and_can_be_named_or_off(self):
+        days = ["2026-11-04", "2026-11-05", "2026-11-06", "2026-11-07"]
+        self.assertEqual(len({recap.music_for(d, "rotate") for d in days}), 4)
+        self.assertEqual(recap.music_for("2026-11-04", "calm-keys").name, "calm-keys.m4a")
+        self.assertIsNone(recap.music_for("2026-11-04", "off"))
+        self.assertEqual(Settings().recap_music, "calm-keys")  # the owner's pick, unless .env says otherwise
+        cmd = " ".join(recap.encoder_command(Path("o.mp4"), 37.0, recap.MUSIC / "calm-keys.m4a"))
+        self.assertIn("-stream_loop -1 -t 37.00 -i", cmd)
+        self.assertIn("afade=t=out:st=34.50:d=2.5", cmd)
+        self.assertNotIn("anullsrc", cmd)
 
     def test_a_recap_that_never_finished_is_reported_once(self):
         stop = threading.Event()

@@ -58,6 +58,8 @@ MUTED = (88, 74, 42)
 ACCENT = (172, 33, 33)
 LOGO = Path(__file__).parent / "assets" / "logo.jpg"
 LOGO_ART = (150, 280, 750, 615)  # the icon and wordmark inside the 900 px logo, for small headers
+MUSIC = Path(__file__).parent / "assets" / "music"  # our own instrumentals (scripts/make_music.py)
+MUSIC_IN, MUSIC_OUT = 0.5, 2.5  # fade in and out, seconds
 
 
 def day_bounds(day: str, tz: str) -> tuple[str, str]:
@@ -307,15 +309,15 @@ def outro(handle: str, fonts: Fonts, today: bool = True) -> Card:
 
 
 def render(rows: list, date_label: str, handle: str, brand: str, fonts: Fonts, out: Path,
-           today: bool = True, weekday: str = "") -> Image.Image:
-    """Write the video to `out`; returns the cover image (the cover card, fully drawn)."""
+           today: bool = True, weekday: str = "", music: Path | None = None) -> Image.Image:
+    """Write the video to `out` (with `music` as its soundtrack, or silent); returns the cover image."""
     cards = [cover(len(rows), date_label, weekday, fonts, today)]
     cards += [story(r, n, len(rows), fonts) for n, r in enumerate(rows, 1)]
     cards.append(outro(handle, fonts, today))
     starts = [sum(c.seconds for c in cards[:i]) for i in range(len(cards))]
     total = sum(c.seconds for c in cards)
     out.parent.mkdir(parents=True, exist_ok=True)
-    ff = subprocess.Popen(encoder_command(out, total), stdin=subprocess.PIPE)
+    ff = subprocess.Popen(encoder_command(out, total, music), stdin=subprocess.PIPE)
     try:
         for f in range(int(total * FPS)):
             t = f / FPS
@@ -333,18 +335,31 @@ def render(rows: list, date_label: str, handle: str, brand: str, fonts: Fonts, o
     return cards[0].frame(cards[0].seconds)
 
 
-def encoder_command(out: Path, seconds: float) -> list[str]:
+def music_for(day: str, choice: str) -> Path | None:
+    """The day's background track: "rotate" takes the next one each day, "off" is silence, and a
+    track's name (e.g. "calm-keys") always uses that one."""
+    tracks = sorted(MUSIC.glob("*.m4a"))
+    if choice == "off" or not tracks:
+        return None
+    named = MUSIC / f"{choice}.m4a"
+    return named if named.exists() else tracks[datetime.fromisoformat(day).toordinal() % len(tracks)]
+
+
+def encoder_command(out: Path, seconds: float, music: Path | None = None) -> list[str]:
     """ffmpeg with its memory bounded: at defaults it took ~1.5 GB for a 40-second 1080p video and the
     server killed the whole service; this takes ~100-260 MB. One thread, a short lookahead, a small
-    input queue, and a silent track of a fixed length (no -shortest, which buffers)."""
+    input queue, and audio of a fixed length (no -shortest, which buffers): the music track, looped if
+    the video is longer and faded in and out, or silence."""
     import imageio_ffmpeg
 
+    audio = (["-stream_loop", "-1", "-t", f"{seconds:.2f}", "-i", str(music),
+              "-af", f"afade=t=in:d={MUSIC_IN},afade=t=out:st={max(0.0, seconds - MUSIC_OUT):.2f}:d={MUSIC_OUT}"]
+             if music else ["-f", "lavfi", "-t", f"{seconds:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
     return [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-thread_queue_size", "2",
-            "-i", "-", "-f", "lavfi", "-t", f"{seconds:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-filter_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-threads", "1",
+            "-i", "-", *audio, "-filter_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-threads", "1",
             "-x264-params", "rc-lookahead=5:sync-lookahead=0:ref=2", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-movflags", "+faststart", str(out)]
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
 
 
 def hashtags(rows: list) -> list[list[str]]:

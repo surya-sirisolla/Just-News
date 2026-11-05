@@ -357,7 +357,8 @@ def make_recap(db: Database, day: str, out_dir) -> tuple[list, str, object] | No
     handle = InstagramPublisher(settings, db)._handle_name() if settings.instagram_enabled else ""
     video = out_dir / f"recap-{day}.mp4"
     cover = recap.render(rows, date_label, handle, settings.brand_name, Fonts(settings.font_bold, settings.font_regular),
-                         video, today=day == local_today(), weekday=datetime.fromisoformat(day).strftime("%A"))
+                         video, today=day == local_today(), weekday=datetime.fromisoformat(day).strftime("%A"),
+                         music=recap.music_for(day, settings.recap_music))
     return rows, str(video), cover
 
 
