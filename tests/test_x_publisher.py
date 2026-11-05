@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest import mock
 
 import requests
 from PIL import Image
@@ -70,7 +72,10 @@ class TextTests(unittest.TestCase):
     def test_x_has_its_own_smaller_daily_cap(self):
         from justnews.config import Settings
         from justnews.agents.publisher import InstagramPublisher
-        s = Settings()
+        with mock.patch.dict(os.environ):  # the defaults, whatever the server's .env overrides
+            for key in ("JUSTNEWS_X_MAX_POSTS_PER_DAY", "JUSTNEWS_MAX_POSTS_PER_DAY"):
+                os.environ.pop(key, None)
+            s = Settings()
         self.assertEqual((s.x_max_posts_per_day, s.max_posts_per_day), (15, 20))
         self.assertEqual(XPublisher.daily_cap.fget(NS(settings=s)), 15)
         self.assertEqual(InstagramPublisher.daily_cap.fget(NS(settings=s)), 20)

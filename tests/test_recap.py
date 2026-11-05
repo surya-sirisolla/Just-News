@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import threading
@@ -214,7 +215,9 @@ class RecapTests(unittest.TestCase):
         self.assertEqual(len({recap.music_for(d, "rotate") for d in days}), 4)
         self.assertEqual(recap.music_for("2026-11-04", "calm-keys").name, "calm-keys.m4a")
         self.assertIsNone(recap.music_for("2026-11-04", "off"))
-        self.assertEqual(Settings().recap_music, "calm-keys")  # the owner's pick, unless .env says otherwise
+        with mock.patch.dict(os.environ):  # the default, whatever the server's .env overrides
+            os.environ.pop("JUSTNEWS_RECAP_MUSIC", None)
+            self.assertEqual(Settings().recap_music, "calm-keys")  # the owner's pick
         cmd = " ".join(recap.encoder_command(Path("o.mp4"), 37.0, recap.MUSIC / "calm-keys.m4a"))
         self.assertIn("-stream_loop -1 -t 37.00 -i", cmd)
         self.assertIn("afade=t=out:st=34.50:d=2.5", cmd)
