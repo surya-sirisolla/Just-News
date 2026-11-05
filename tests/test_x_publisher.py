@@ -71,8 +71,8 @@ class TextTests(unittest.TestCase):
         from justnews.config import Settings
         from justnews.agents.publisher import InstagramPublisher
         s = Settings()
-        self.assertEqual((s.x_max_posts_per_day, s.max_posts_per_day), (8, 20))
-        self.assertEqual(XPublisher.daily_cap.fget(NS(settings=s)), 8)
+        self.assertEqual((s.x_max_posts_per_day, s.max_posts_per_day), (15, 20))
+        self.assertEqual(XPublisher.daily_cap.fget(NS(settings=s)), 15)
         self.assertEqual(InstagramPublisher.daily_cap.fget(NS(settings=s)), 20)
 
     def test_text_has_source_and_no_links(self):
