@@ -99,7 +99,7 @@ class RecapTests(unittest.TestCase):
                                side_effect=lambda db, day, out: made.append(day) or (self.db.published_between(
                                    *recap.day_bounds(day, "Asia/Kolkata")), str(self.write_video()), Image.new("RGB", (8, 8)))), \
                 mock.patch.object(cli, "InstagramPublisher", lambda s, db: NS(
-                    publish_reel=lambda key, video, cover, caption: posted.append((key, caption)) or ("m1", "https://ig/reel/1"))):
+                    publish_reel=lambda key, video, caption, cover_at_ms: posted.append((key, caption)) or ("m1", "https://ig/reel/1"))):
             self.assertEqual(cli.post_recap(self.db, self.day), "posted https://ig/reel/1")
             self.assertTrue(cli.post_recap(self.db, self.day).startswith("already done"))
         self.assertEqual(len(posted), 1)
@@ -171,13 +171,14 @@ class RecapTests(unittest.TestCase):
     def test_reel_goes_to_instagram_as_reels_with_a_cover(self):
         graph, store = FakeGraph(), FakeStore()
         pub = InstagramPublisher(self.settings, self.db, store=store, session=graph, sleep=lambda s: None)
-        media_id, link = pub.publish_reel("recaps/2026-11-04", b"video", Image.new("RGB", (1080, 1920)), "caption")
+        media_id, link = pub.publish_reel("posts/recaps/2026-11-04", b"video", "caption", cover_at_ms=2000)
         reel = next(d for d in graph.containers.values() if d.get("media_type") == "REELS")
         self.assertEqual(reel["share_to_feed"], "true")
-        self.assertTrue(reel["video_url"].endswith("recaps/2026-11-04.mp4?X-Amz-Signature=abc"))
-        self.assertIn("cover", reel["cover_url"])
-        self.assertEqual(store.types["recaps/2026-11-04.mp4"], "video/mp4")
-        self.assertEqual(len(store.deleted), 2)
+        self.assertTrue(reel["video_url"].endswith("posts/recaps/2026-11-04.mp4?X-Amz-Signature=abc"))
+        self.assertEqual(reel["thumb_offset"], "2000")
+        self.assertNotIn("cover_url", reel)  # a separate cover image made Instagram reject the Reel
+        self.assertEqual(store.types["posts/recaps/2026-11-04.mp4"], "video/mp4")
+        self.assertEqual(len(store.deleted), 1)
         self.assertTrue(link.startswith("https://www.instagram.com/p/POST"))
 
     def write_video(self) -> Path:

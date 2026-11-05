@@ -515,22 +515,24 @@ class InstagramPublisher(Publisher):
 
     def _wait(self, container: str, attempts: int = POLL_ATTEMPTS, interval: float = POLL_SECONDS) -> None:
         for _ in range(attempts):  # Instagram downloads and processes the media first
-            status = self._call("GET", container, retries=2, fields="status_code,status").get("status_code")
+            answer = self._call("GET", container, retries=2, fields="status_code,status")
+            status = answer.get("status_code")
             if status == "FINISHED":
                 return
             if status in ("ERROR", "EXPIRED"):
-                raise PublishError(f"Instagram could not process the media (status {status})")
+                detail = f": {answer['status']}" if answer.get("status") else ""
+                raise PublishError(f"Instagram could not process the media (status {status}{detail})")
             self.sleep(interval)
         raise PublishError("Instagram took too long to process the media")
 
-    def publish_reel(self, key: str, video: bytes, cover: Image.Image, caption: str) -> tuple[str, str]:
-        """Post a video as a Reel (also shown in the feed); returns (media id, permalink)."""
-        keys = [f"{key}.mp4", f"{key}-cover.jpg"]
+    def publish_reel(self, key: str, video: bytes, caption: str, cover_at_ms: int = 0) -> tuple[str, str]:
+        """Post a video as a Reel (also shown in the feed); its cover is the frame at `cover_at_ms`
+        (a separate cover image made Instagram fail the whole Reel). Returns (media id, permalink)."""
+        keys = [f"{key}.mp4"]
         try:
             video_url = self._upload(keys[0], video, "video/mp4")
-            cover_url = self._upload(keys[1], jpeg_bytes(cover))
             container = self._call("POST", f"{self.ig}/media", retries=1, media_type="REELS", video_url=video_url,
-                                   cover_url=cover_url, caption=caption, share_to_feed="true")["id"]
+                                   thumb_offset=str(cover_at_ms), caption=caption, share_to_feed="true")["id"]
             self._wait(container, REEL_POLL_ATTEMPTS, REEL_POLL_SECONDS)
             try:
                 media_id = self._call("POST", f"{self.ig}/media_publish", creation_id=container)["id"]

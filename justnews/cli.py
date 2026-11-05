@@ -374,12 +374,12 @@ def post_recap(db: Database, day: str, force: bool = False) -> str:
         if made is None:
             db.set_state(key, "skipped: fewer than two stories posted")
             return "skipped: fewer than two stories posted"
-        rows, video, cover = made
+        rows, video, _ = made
         date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
         tags = merge_hashtags(recap.hashtags(rows))
         media_id, link = InstagramPublisher(settings, db).publish_reel(
-            f"posts/recaps/{day}", Path(video).read_bytes(), cover,  # posts/: the prefix the server may write
-            recap.caption(rows, date_label, tags, day == local_today()))
+            f"posts/recaps/{day}", Path(video).read_bytes(),  # posts/: the prefix the server may write
+            recap.caption(rows, date_label, tags, day == local_today()), cover_at_ms=recap.COVER_AT_MS)
     except Exception as exc:
         log.exception("Daily recap failed (attempt %d)", tries)
         if tries >= RECAP_ATTEMPTS:

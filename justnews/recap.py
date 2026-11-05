@@ -24,6 +24,7 @@ W, H, FPS = 1080, 1920, 30
 OUT_W, OUT_H = 720, 1280  # encoded size: a standard Reel size that fits the server's memory (2 GB, no swap)
 LEFT, RIGHT = 72, 960            # Instagram's buttons cover the right edge
 INTRO, STORY, OUTRO, PUSH = 2.5, 3.5, 3.0, 0.3  # seconds
+COVER_AT_MS = 2000  # the Reel's cover: the intro card, fully drawn
 TOP_H = 900                      # photo / colour band height
 
 
