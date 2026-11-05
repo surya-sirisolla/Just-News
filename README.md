@@ -329,36 +329,29 @@ world feeds (BBC, Al Jazeera, TechCrunch, The Verge) supply international news.
 
 ## The daily recap Reel (9:30 PM IST)
 
-Every evening at `JUSTNEWS_RECAP_TIME` (21:30, owner's time zone), `serve` turns the stories posted
-that day (on Instagram or X, each once; the best `JUSTNEWS_RECAP_MAX_STORIES`, 10, in posting order)
-into one vertical video (`justnews/recap.py`, 1080×1920, about 3.5 s per story) and posts it to
-Instagram as a Reel, then sends the link on WhatsApp.
-- **The video:** a "TODAY'S NEWS" card with the date, one card per story (licensed photo with a
-  slow zoom and its credit, or the story's short text on its category colour; headline, one fact,
-  source; progress bars at the top), and a "Follow @handle" card. No models are involved: Pillow
-  draws, the ffmpeg bundled with `imageio-ffmpeg` encodes. The audio track is silent: Instagram's
-  API can't add music from its library.
+Every evening at `JUSTNEWS_RECAP_TIME` (21:30, owner's time zone), `serve` turns the day's top
+`JUSTNEWS_RECAP_MAX_STORIES` (5) posted stories into one vertical video (`justnews/recap.py`) and
+posts it to Instagram as a Reel, then sends the link on WhatsApp.
+- **A fixed template in the brand colours** (the logo's beige, near-black, a red accent;
+  `justnews/assets/logo.jpg`). Only the data changes. The cover (logo, "TODAY'S TOP NEWS", weekday
+  and date, number of stories) is complete from the first frame and is the Reel's thumbnail, so
+  anyone sees which day it is about at once.
+- **One card per story, about 8 seconds:** small logo and "1 / 5" at the top, then the category,
+  the headline, a modest photo card with a slow zoom (licensed photos only), the key facts one by
+  one and the source. Each card fades into the next card's empty background, then its parts rise in.
+- **Order by attention, so it changes with the day:** 40% audience interest (Jev's score from
+  evaluation) + 30% importance + today's topic heat (how many of the day's headlines share the
+  story's topic, relative to the hottest topic) + India +6 / South India +3. At least one South
+  Indian story is kept when the day had one. No extra model calls.
+- **Light on the server:** drawn at 1080×1920, encoded at 720×1280 with bounded ffmpeg memory
+  (about 100 MB); `OOMPolicy=continue` keeps the bot running even if the encoder is ever killed.
+  The audio track is silent: Instagram's API can't add music from its library.
 - **Once a day:** the result is saved in `agent_state`, so restarts don't post twice; after a
   restart it still runs until quiet hours start (11 PM). A day with fewer than two stories is
-  skipped. A failure is retried twice more, then you get a WhatsApp message.
+  skipped, and a failure is reported on WhatsApp.
 - **By hand:** `python -m justnews recap --dry-run` makes the video without posting;
-  `python -m justnews recap` posts it (once per day).
-
-## Talking to the bot
-
-- **Reactions instead of replies:** numbers or *yes* get 👍 at once (the links follow when posted),
-  *none* only 👍, "ok"/"thanks"/👍/🙏 a ❤️ with no reply and no model call, "research on …" 👀 (the
-  list is the answer), an edit ✍️. Every message gets blue ticks, and "typing…" shows while the bot
-  works on a reply that takes more than a moment.
-- **Your changes go to the writer:** "make 2 simpler", "mention Hyderabad in 1", "shorter headline
-  for 3" send your words to the content creator as the owner's note; the rewritten story comes back
-  (Jev checks it again), with the writer's reply when it couldn't do something. It never puts in a
-  fact or figure the source doesn't report: say "it's 600+, post that news" and the bot searches for
-  a report with that figure instead, and the writer leads with it if the source has it.
-- **Plain language:** every post is written for someone who doesn't follow the news
-  (`justnews/plain.py`): everyday words, short sentences, abbreviations spelled out ("Supreme
-  Court", not "SC"). A free check flags newspaper shorthand, unexplained terms (SEC, Agniveers,
-  cusecs, POCSO…), legal section numbers and long sentences; flagged posts get one rewrite.
+  `python -m justnews recap [--day YYYY-MM-DD] [--force]` posts it (`--force` retries a failed day;
+  a posted recap is never posted again).
 
 ## Research on request
 

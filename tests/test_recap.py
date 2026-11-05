@@ -64,7 +64,7 @@ class RecapTests(unittest.TestCase):
                                      (when, aid, platform))
         self.db.conn.commit()
 
-    def test_todays_stories_once_each_best_first_shown_in_posting_order(self):
+    def test_todays_stories_once_each_most_important_first(self):
         self.published(self.ids[:2])
         self.published(self.ids[:1], platform="x")          # on both platforms: counted once
         yesterday = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
@@ -72,13 +72,69 @@ class RecapTests(unittest.TestCase):
         rows = self.db.published_between(*recap.day_bounds(self.day, "Asia/Kolkata"))
         self.assertEqual([r["article_id"] for r in rows], self.ids[:2])
         self.assertEqual([r["headline"] for r in recap.pick(rows, 1)], ["Headline 2"])  # the best one
-        text = recap.caption(rows, "4 Nov 2026", ["#Delhi"])
-        self.assertTrue(text.startswith("Today's news in 2 stories (4 Nov 2026):\n\n1. Headline 1\n2. Headline 2"))
+        picked = recap.pick(rows, 5)
+        self.assertEqual([r["headline"] for r in picked], ["Headline 2", "Headline 1"])  # most important first
+        text = recap.caption(picked, "4 Nov 2026", ["#Delhi"])
+        self.assertTrue(text.startswith("Today's top 2 stories (4 Nov 2026):\n\n1. Headline 2\n2. Headline 1"))
 
     def test_a_past_days_recap_does_not_say_today(self):
         self.published(self.ids[:2])
         rows = self.db.published_between(*recap.day_bounds(self.day, "Asia/Kolkata"))
-        self.assertTrue(recap.caption(rows, "4 Nov 2026", [], today=False).startswith("The news of 4 Nov 2026 in 2 stories:"))
+        self.assertTrue(recap.caption(rows, "4 Nov 2026", [], today=False).startswith("The top 2 stories of 4 Nov 2026:"))
+
+    def test_the_hottest_story_leads_and_the_order_changes_with_the_day(self):
+        def row(aid, title, region, overall, interest):
+            return {"article_id": aid, "title": title, "headline": title, "region": region, "overall": overall,
+                    "interest": interest, "posted_at": "2026-11-04T10:00:00+00:00", "posted_seq": 0}
+        rows = [row("a", "Cabinet approves package", "India", 75, 53),
+                row("b", "AI godfather warns about AI", "International", 80, 85),
+                row("c", "US midterm election results", "International", 72, 50),
+                row("d", "Tamil Nadu limits firecrackers", "South India", 73, 72)]
+        quiet_day = recap.pick(rows, 4)
+        self.assertEqual(quiet_day[0]["title"], "AI godfather warns about AI")  # most interesting leads
+        titles = ["US midterm election live", "Midterm election: Democrats lead", "US election results midterm",
+                  "Midterm election turnout", "Election day in US midterm"] * 2
+        heat = {r["article_id"]: recap.related_count(r["title"], titles) for r in rows}
+        self.assertGreater(heat["c"], 5)
+        self.assertEqual(recap.pick(rows, 4, heat)[0]["title"], "US midterm election results")  # the day's hot topic
+        self.assertEqual(recap.pick([row("x", "Chennai rains", None, 70, 70), row("y", "World", "International", 70, 70)],
+                                    2)[0]["title"], "Chennai rains")  # region bonus, worked out from the title
+
+    def test_a_south_indian_story_is_always_in_when_the_day_had_one(self):
+        def row(title, region, overall, seq):
+            return {"title": title, "headline": title, "region": region, "overall": overall,
+                    "posted_at": "2026-11-04T10:00:00+00:00", "posted_seq": seq}
+        rows = [row(f"India {i}", "India", 80 - i, i) for i in range(5)] + [row("Karnataka fares", "South India", 50, 9)]
+        picked = recap.pick(rows, 5)
+        self.assertEqual(len(picked), 5)
+        self.assertIn("Karnataka fares", [r["title"] for r in picked])
+        self.assertNotIn("India 4", [r["title"] for r in picked])  # the lowest-priority one made room
+
+    def test_story_cards_last_as_long_as_needed_up_to_six_seconds(self):
+        def row(caption, photo=None):
+            return {"headline": "Delhi AQI hits 350", "category": "India", "source_name": "The Hindu",
+                    "caption": caption, "ig_caption": None, "photo_path": photo, "image_credit": None}
+        Row = type("Row", (dict,), {"keys": dict.keys})
+        full = recap.story(Row(row("The city recorded its worst air in 287 days. Schools will stay shut on "
+                                   "Friday. Trucks are banned from entering the city.")), 1, 5, Fonts())
+        bare = recap.story(Row(row("Delhi AQI hits 350.")), 1, 5, Fonts())
+        self.assertEqual(full.seconds, 6.0)  # three facts: the 6-second maximum
+        self.assertEqual(bare.seconds, 4.0)  # headline only: the 4-second minimum
+        self.assertEqual(recap.INTRO, 1.0)
+        self.assertEqual(recap.reel_tags(["#WorldNews", "#USMidterms", "#indianews", "#Diwali", "#TamilNadu", "#Cricket"]),
+                         ["#IndiaNews", "#DailyNews", "#USMidterms", "#Diwali", "#TamilNadu"])
+
+    def test_cover_is_complete_from_the_first_frame(self):
+        card = recap.cover(5, "4 November 2026", "Wednesday", Fonts())
+        self.assertEqual(card.frame(0).tobytes(), card.frame(recap.INTRO).tobytes())
+
+    def test_facts_are_short_points_without_the_headline_question_or_credit(self):
+        row = {"headline": "Delhi AQI hits 350", "source_name": "The Hindu", "caption": "c",
+               "ig_caption": "Delhi AQI hits 350.\n\nThe city recorded its worst air in 287 days, according to "
+                             "The Hindu.\n\nSchools will stay shut on Friday.\n\nHave you noticed the smog?"}
+        row = type("Row", (dict,), {"keys": dict.keys})(row)
+        self.assertEqual(recap.facts(row), ["The city recorded its worst air in 287 days.",
+                                            "Schools will stay shut on Friday."])
 
     def test_day_bounds_are_the_local_day_in_utc(self):
         self.assertEqual(recap.day_bounds("2026-11-04", "Asia/Kolkata"),
@@ -136,7 +192,7 @@ class RecapTests(unittest.TestCase):
         self.published(self.ids)
         rows = self.db.published_between(*recap.day_bounds(self.day, "Asia/Kolkata"))
         out = self.root / "recap.mp4"
-        with mock.patch.multiple(recap, INTRO=0.4, STORY=0.4, OUTRO=0.4, PUSH=0.1):
+        with mock.patch.multiple(recap, INTRO=0.4, STORY_MIN=0.4, STORY_MAX=0.4, OUTRO=0.4, FADE=0.1):
             cover = recap.render(rows, "4 Nov 2026", "just_newzzzz", "Just News", Fonts(), out)
         self.assertEqual(cover.size, (1080, 1920))  # the cover image stays full size
         import imageio_ffmpeg

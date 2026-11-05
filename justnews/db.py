@@ -204,7 +204,7 @@ class Database:
         if "region" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(articles)")}:
             self.conn.execute("ALTER TABLE articles ADD COLUMN region TEXT")
         post_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(posts)")}
-        for column in ("ig_caption", "x_post", "x_hashtag"):  # platform versions
+        for column in ("ig_caption", "x_post", "x_hashtag", "topic"):  # platform versions; the writer's topic
             if column not in post_columns:
                 self.conn.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
         outbox_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}
@@ -347,16 +347,17 @@ class Database:
             c.execute(
                 """INSERT OR REPLACE INTO posts(article_id, run_id, headline, caption, hashtags, attribution,
                        image_text, visual, image_query, status, review_note, model, created_at, ig_caption, x_post,
-                       x_hashtag)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       x_hashtag, topic)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (article_id, run_id, post["headline"], post["caption"], json.dumps(post["hashtags"]),
                  post["attribution"], post["image_text"], post["visual"], post.get("image_query"),
                  post["status"], post.get("review_note"), model, _now(), post.get("ig_caption"), post.get("x_post"),
-                 post.get("x_hashtag")))
+                 post.get("x_hashtag"), post.get("topic")))
 
     def posts_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT p.*, a.title, a.url, a.source_name, a.category, a.published_at, e.overall,
+            """SELECT p.*, a.title, a.url, a.source_name, COALESCE(p.topic, a.category) AS category, a.published_at,
+                      e.overall,
                       i.kind AS image_kind, i.path AS image_path, i.credit AS image_credit, i.photo_path,
                       i.license AS image_license, i.source_page AS image_source, i.note AS image_note
                FROM posts p JOIN articles a ON a.id = p.article_id
@@ -430,7 +431,7 @@ class Database:
 
     def posts_awaiting_approval(self, run_id: str, limit: int) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT p.*, a.source_name, a.url, a.category, e.overall FROM posts p
+            """SELECT p.*, a.source_name, a.url, COALESCE(p.topic, a.category) AS category, e.overall FROM posts p
                JOIN articles a ON a.id = p.article_id
                LEFT JOIN evaluations e ON e.article_id = p.article_id AND e.run_id = p.run_id
                WHERE p.run_id = ? AND p.approval IS NULL ORDER BY e.overall DESC LIMIT ?""",
@@ -506,15 +507,22 @@ class Database:
     def published_between(self, start: str, end: str) -> list[sqlite3.Row]:
         """Stories published (on any platform) between two UTC times, once each, in posting order."""
         return self.conn.execute(
-            """SELECT p.*, a.title, a.url, a.source_name, a.category, a.published_at, a.region,
+            """SELECT p.*, a.title, a.url, a.source_name, COALESCE(p.topic, a.category) AS category, a.published_at,
+                      a.region,
                       i.kind AS image_kind, i.path AS image_path, i.credit AS image_credit, i.photo_path,
                       MIN(pub.updated_at) AS posted_at, MIN(pub.rowid) AS posted_seq,
-                      (SELECT MAX(e.overall) FROM evaluations e WHERE e.article_id = p.article_id) AS overall
+                      (SELECT MAX(e.overall) FROM evaluations e WHERE e.article_id = p.article_id) AS overall,
+                      (SELECT MAX(e.audience_interest) FROM evaluations e WHERE e.article_id = p.article_id) AS interest
                FROM publications pub JOIN posts p ON p.article_id = pub.article_id
                JOIN articles a ON a.id = p.article_id
                LEFT JOIN images i ON i.article_id = p.article_id
                WHERE pub.status = 'published' AND pub.updated_at >= ? AND pub.updated_at < ?
                GROUP BY p.article_id ORDER BY posted_at, posted_seq""", (start, end)).fetchall()
+
+    def titles_seen_between(self, start: str, end: str) -> list[str]:
+        """Every headline discovered in a time window: how much of the day's news was about what."""
+        return [r[0] for r in self.conn.execute(
+            "SELECT title FROM articles WHERE first_seen_at >= ? AND first_seen_at < ?", (start, end))]
 
     def post_headline(self, article_id: str) -> str | None:
         row = self.conn.execute("SELECT headline FROM posts WHERE article_id = ?", (article_id,)).fetchone()
@@ -544,7 +552,8 @@ class Database:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
         return self.conn.execute(
             """SELECT pub.article_id, pub.media_id, pub.updated_at AS published_at, p.headline, p.caption,
-                      p.ig_caption, p.x_post, p.hashtags, a.category, i.kind AS image_kind,
+                      p.ig_caption, p.x_post, p.hashtags, COALESCE(p.topic, a.category) AS category,
+                      i.kind AS image_kind,
                       m.checks, m.likes, m.comments, m.shares, m.saves, m.views, m.reach, m.fetched_at
                FROM publications pub JOIN posts p ON p.article_id = pub.article_id
                JOIN articles a ON a.id = pub.article_id

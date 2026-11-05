@@ -142,7 +142,7 @@ class PublisherTests(unittest.TestCase):
         result = self.publisher().publish("r1", self.ids)
         children = {c: d for c, d in self.graph.containers.items() if d.get("is_carousel_item") == "true"}
         parent = next(d for d in self.graph.containers.values() if d.get("media_type") == "CAROUSEL")
-        self.assertEqual(len(children), 5)  # cover, 3 stories, closing slide
+        self.assertEqual(len(children), 4)  # story 1 as the cover, stories 2-3, closing: no story twice
         self.assertEqual(parent["children"].split(","), list(children))
         self.assertIn("1. Headline 1\n2. Headline 2\n3. Headline 3", parent["caption"])
         self.assertIn("Photos: File photo: Jane / Wikimedia Commons, CC BY 4.0", parent["caption"])
@@ -151,7 +151,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual([a for a, _ in result.posted], self.ids)
         slide = Image.open(__import__("io").BytesIO(next(iter(self.store.objects.values()))))
         self.assertEqual(slide.size, (1080, 1350))
-        self.assertEqual(len(self.store.deleted), 5)
+        self.assertEqual(len(self.store.deleted), 4)
         again = self.publisher().publish("r1", self.ids)
         self.assertEqual([why for _, why in again.skipped], ["already posted"] * 3)
 
@@ -296,7 +296,7 @@ class PublisherTests(unittest.TestCase):
         service.request("r1")
         self.assertEqual(service.handle_message(Incoming("m1", "919800000001", "1 2", 0)), "approved 1, 2, posted 2")
         reply = [r[0] for r in self.db.conn.execute("SELECT body FROM wa_outbox ORDER BY id")][-1]
-        self.assertIn("Posted 1 and 2 to Instagram as one carousel:\nhttps://www.instagram.com/p/POST5/", reply)
+        self.assertIn("Posted 1 and 2 to Instagram as one carousel:\nhttps://www.instagram.com/p/POST4/", reply)
 
 
 if __name__ == "__main__":

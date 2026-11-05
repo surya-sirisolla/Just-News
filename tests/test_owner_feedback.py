@@ -127,5 +127,27 @@ class WriterTests(Base):
         self.assertIn("Lead with the AQI above 600", model.prompts[0][1])
 
 
+class TopicTests(Base):
+    def test_topic_comes_from_the_story_not_the_feed_section(self):
+        from justnews.agents.content import topic_of
+        self.assertEqual(topic_of("Heavy rain alerts issued for southern India IMD", "Business"), "Weather")
+        self.assertEqual(topic_of("Delhi AQI crosses 600", "India"), "Environment")
+        self.assertEqual(topic_of("Trump signals interest in working with Democrats", "Business"), "Politics")
+        self.assertEqual(topic_of("Infosys shares rise after results", "Business"), "Business")
+        self.assertEqual(topic_of("Kochi metro opens new line", "South India"), "India")
+
+    def test_the_writers_topic_is_stored_and_shown_as_the_category(self):
+        self.db.set_post_approval([self.ids[0]], "requested")
+        revise = {"posts": [{**draft("P1", topic="Weather"), "reply": "ok"}]}
+        jev = NS(usage=NS(as_dict=lambda: {}), review_posts=lambda posts, sources: {})
+        ContentCreatorAgent(self.settings, self.db, clients=[FakeModel({"revise": revise})], verifier=jev).revise_posts(
+            "r1", [self.ids[0]], "simpler")
+        post = next(p for p in self.db.posts_for_run("r1") if p["article_id"] == self.ids[0])
+        self.assertEqual((post["topic"], post["category"]), ("Weather", "Weather"))
+        other = next(p for p in self.db.posts_for_run("r1") if p["article_id"] == self.ids[1])
+        self.assertEqual(other["category"], other["topic"] or self.db.conn.execute(
+            "SELECT category FROM articles WHERE id = ?", (self.ids[1],)).fetchone()[0])  # older posts: the feed's
+
+
 if __name__ == "__main__":
     unittest.main()

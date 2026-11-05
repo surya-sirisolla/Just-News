@@ -14,6 +14,8 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # refuse decompression bombs from downloade
 CATEGORY_COLORS = {
     "Technology": (37, 99, 235), "AI": (124, 58, 237), "Business": (5, 150, 105),
     "Politics": (220, 38, 38), "World": (217, 119, 6), "India": (190, 18, 60), "South India": (13, 148, 136),
+    "Weather": (2, 132, 199), "Environment": (101, 163, 13), "Health": (219, 39, 119), "Science": (79, 70, 229),
+    "Sports": (234, 88, 12), "Crime": (71, 85, 105),
 }
 DEFAULT_COLOR = (17, 24, 39)
 INK = (17, 24, 39)

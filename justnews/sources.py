@@ -63,7 +63,7 @@ SOURCES: list[Source] = [
     # Business (Indian outlets, plus one international)
     Source("The Hindu", "https://www.thehindu.com/business/feeder/default.rss", "Business", region="India"),
     Source("The Indian Express", "https://indianexpress.com/section/business/feed/", "Business", region="India"),
-    Source("Mint", "https://www.livemint.com/rss/news", "Business", region="India"),
+    Source("Mint", "https://www.livemint.com/rss/news", "India", region="India"),  # Mint's general news feed
     Source("The Economic Times", "https://economictimes.indiatimes.com/rssfeedstopstories.cms", "Business", region="India"),
     Source("Google News", google_topic("BUSINESS", GN_INDIA), "Business", kind="google_news", region="India"),
     Source("BBC News", "https://feeds.bbci.co.uk/news/business/rss.xml", "Business"),

@@ -129,7 +129,8 @@ class XPublisherTests(unittest.TestCase):
                                            "image_text": "x", "visual": "graphic", "status": "draft"}, "gemini-test")
             png = self.root / f"t{i}.png"
             Image.new("RGBA", (1080, 1080), (10, 20, 30, 255)).save(png)
-            self.db.save_image("r1", a.id, {"kind": "graphic", "path": str(png)})
+            self.db.save_image("r1", a.id, {"kind": "photo" if i == 1 else "graphic", "path": str(png),
+                                            "credit": "File photo: Jane / Wikimedia Commons, CC0" if i == 1 else None})
         self.ids = [a.id for a in arts]
 
     def tearDown(self):
@@ -187,7 +188,7 @@ class XPublisherTests(unittest.TestCase):
         self.assertEqual(len(result.posted), 1)
         self.assertIn("daily limit", result.failed[0][1])
 
-    def test_uploads_image_then_posts_with_media_and_signed_requests(self):
+    def test_a_photo_goes_up_with_the_post_and_a_text_template_does_not(self):
         result = self.publisher().publish("r1", self.ids[:2])
         self.assertEqual([link for _, link in result.posted],
                          ["https://x.com/i/status/1000", "https://x.com/i/status/1001"])
@@ -197,6 +198,10 @@ class XPublisherTests(unittest.TestCase):
         self.assertEqual(upload[3]["data"], {"media_category": "tweet_image"})
         post = self.x.calls[1][3]["json"]
         self.assertEqual(post["media"], {"media_ids": ["m1"]})
+        text_only = self.x.calls[2]  # story 2 has only a text template: posted as text, nothing uploaded
+        self.assertEqual(text_only[1], "tweets")
+        self.assertNotIn("media", text_only[3]["json"])
+        self.assertEqual(sum(1 for c in self.x.calls if c[1] == "media/upload"), 1)
         self.assertIn("Source: BBC News", post["text"])
         self.assertNotIn("http", post["text"])
         self.assertTrue(all(c[2]["Authorization"].startswith("OAuth ") for c in self.x.calls))
@@ -204,10 +209,10 @@ class XPublisherTests(unittest.TestCase):
 
     def test_no_credits_stops_with_a_clear_reason(self):
         body = {"title": "Client Forbidden", "reason": "client-not-enrolled", "detail": "attach to a Project"}
-        result = self.publisher(FakeX(fail=("media/upload", 403, body))).publish("r1", self.ids)
+        result = self.publisher(FakeX(fail=("tweets", 403, body))).publish("r1", self.ids)
         self.assertEqual(result.failed[0][1], NO_CREDITS)
         self.assertEqual(len(result.failed), 3)
-        self.assertEqual(sum(1 for c in self.x.calls if c[1] == "media/upload"), 1)  # stopped after the first
+        self.assertEqual(sum(1 for c in self.x.calls if c[1] == "tweets"), 1)  # stopped after the first
 
     def test_timeout_after_posting_counts_as_posted_once(self):
         result = self.publisher(FakeX(post_timeout="after_posting")).publish("r1", [self.ids[0]])
@@ -235,7 +240,7 @@ class XPublisherTests(unittest.TestCase):
     def test_whatsapp_reply_lists_each_platform(self):
         ig = NS(publish=lambda run_id, ids: NS(posted=[(a, f"https://www.instagram.com/p/{a[:4]}/") for a in ids],
                                                failed=[], skipped=[]))
-        xpub = self.publisher(FakeX(fail=("media/upload", 402, {"title": "Payment Required"})))
+        xpub = self.publisher(FakeX(fail=("tweets", 402, {"title": "Payment Required"})))
         service = ApprovalService(self.settings, self.db, OutboxClient(self.db),
                                   designer=lambda run_id, ids: NS(photos=0, graphics=len(ids), failed=0),
                                   publishers={"Instagram": ig.publish, "X": xpub.publish})

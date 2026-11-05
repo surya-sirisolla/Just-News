@@ -145,7 +145,8 @@ class Settings:
     x_queue_max_hours: float = field(default_factory=lambda: _float("JUSTNEWS_X_QUEUE_MAX_HOURS", 3))
     # Every day at this local time, a Reel recaps the stories posted that day ("off" disables).
     recap_time: str = field(default_factory=lambda: os.getenv("JUSTNEWS_RECAP_TIME", "21:30"))
-    recap_max_stories: int = field(default_factory=lambda: _int("JUSTNEWS_RECAP_MAX_STORIES", 10))
+    # Clarity over count: the day's top stories, about 8 seconds each.
+    recap_max_stories: int = field(default_factory=lambda: _int("JUSTNEWS_RECAP_MAX_STORIES", 5))
 
     # X (API v2) with OAuth 1.0a keys for the posting account itself. Posting needs Pay-Per-Use
     # credits on console.x.com. Publishing is on when all four are set.

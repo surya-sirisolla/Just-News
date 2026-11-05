@@ -1,4 +1,5 @@
-"""Instagram carousel slides (1080x1350, 4:5): a cover, one slide per story, and a closing slide.
+"""Instagram carousel slides (1080x1350, 4:5): the lead story as the cover, one slide for each other
+story, and a closing slide (the lead story is not repeated after the cover).
 
 The cover's label is "BREAKING NEWS" only when the lead story is under an hour old ("LATEST" otherwise).
 Story slides show the licensed photo (with its credit) or, without one, the story's short image
@@ -15,7 +16,7 @@ SIZE = W, H = 1080, 1350
 LEFT, RIGHT = 72, 1008
 DARK, WHITE, GREY, RED = (12, 14, 20), (255, 255, 255), (172, 178, 188), (220, 38, 38)
 PHOTO_H = 620
-MAX_STORIES = 8  # Instagram allows 10 slides: the cover, 8 stories and the closing slide
+MAX_STORIES = 9  # Instagram allows 10 slides: the lead story as cover, 8 more stories and the closing slide
 
 
 def _cover_crop(img: Image.Image, w: int, h: int) -> Image.Image:
@@ -63,16 +64,20 @@ def cover(lead: dict, more: int, label: str, date: str, brand: str, fonts: Fonts
     d.rectangle([0, 96, LEFT + d.textlength(label, font=bf) + 110, 196], fill=RED)
     d.ellipse([LEFT, 130, LEFT + 32, 162], fill=WHITE)
     d.text((LEFT + 56, 114), label, font=bf, fill=WHITE)
-    hf = fonts.get(84, bold=True)
+    # The cover is the lead story's own slide: headline, its key fact and source, bottom-aligned.
+    hf, ff = fonts.get(80, bold=True), fonts.get(40)
     head = _lines(d, lead["headline"], hf, RIGHT - LEFT, 4)
-    y = 860 - (len(head) - 3) * 96
+    fact = _lines(d, lead.get("caption") or "", ff, RIGHT - LEFT, 3)
+    y = 1180 - (len(head) * 92 + 24 + len(fact) * 52 + 40)
     for i, line in enumerate(head):
-        d.text((LEFT, y + i * 96), line, font=hf, fill=WHITE)
-    y += len(head) * 96 + 24
-    meta = f"+ {more} more {'story' if more == 1 else 'stories'}  ·  {date}" if more else date
-    d.text((LEFT, y), meta, font=fonts.get(38, bold=True), fill=GREY)
+        d.text((LEFT, y + i * 92), line, font=hf, fill=WHITE)
+    y += len(head) * 92 + 24
+    for i, line in enumerate(fact):
+        d.text((LEFT, y + i * 52), line, font=ff, fill=(225, 228, 234))
+    y += len(fact) * 52 + 40
+    d.text((LEFT, y), f"Source: {lead['source']}  ·  {date}", font=fonts.get(32), fill=GREY)
     if more:
-        _hint(d, "Swipe for more", y - 4, fonts)
+        _hint(d, f"+{more} more", y - 2, fonts)
     if photo and lead.get("credit"):
         d.text((LEFT, H - 40), lead["credit"], font=fonts.get(22), fill=GREY, anchor="ls")
     return img
@@ -132,8 +137,8 @@ def closing(total: int, handle: str, brand: str, fonts: Fonts) -> Image.Image:
 
 
 def render(stories: list[dict], label: str, date: str, handle: str, brand: str, fonts: Fonts) -> list[Image.Image]:
-    """Slides for 2-8 stories, lead story first."""
+    """Slides for 2-8 stories: the lead story as the cover, then the others numbered from 2."""
     total = len(stories)
     return ([cover(stories[0], total - 1, label, date, brand, fonts)]
-            + [story(s, n, total, fonts) for n, s in enumerate(stories, 1)]
+            + [story(s, n, total, fonts) for n, s in enumerate(stories[1:], 2)]
             + [closing(total, handle, brand, fonts)])

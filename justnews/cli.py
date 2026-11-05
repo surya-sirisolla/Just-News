@@ -347,14 +347,17 @@ RECAP_ATTEMPTS = 3
 
 def make_recap(db: Database, day: str, out_dir) -> tuple[list, str, object] | None:
     """Render the day's recap video; None when fewer than two stories were posted."""
-    rows = recap.pick(db.published_between(*recap.day_bounds(day, settings.timezone)), settings.recap_max_stories)
+    bounds = recap.day_bounds(day, settings.timezone)
+    posted, seen = db.published_between(*bounds), db.titles_seen_between(*bounds)
+    heat = {r["article_id"]: recap.related_count(r["title"], seen) for r in posted}  # today's topic heat
+    rows = recap.pick(posted, settings.recap_max_stories, heat)
     if len(rows) < 2:
         return None
-    date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
+    date_label = datetime.fromisoformat(day).strftime("%-d %B %Y")
     handle = InstagramPublisher(settings, db)._handle_name() if settings.instagram_enabled else ""
     video = out_dir / f"recap-{day}.mp4"
     cover = recap.render(rows, date_label, handle, settings.brand_name, Fonts(settings.font_bold, settings.font_regular),
-                         video, today=day == local_today())
+                         video, today=day == local_today(), weekday=datetime.fromisoformat(day).strftime("%A"))
     return rows, str(video), cover
 
 
@@ -376,7 +379,7 @@ def post_recap(db: Database, day: str, force: bool = False) -> str:
             return "skipped: fewer than two stories posted"
         rows, video, _ = made
         date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
-        tags = merge_hashtags(recap.hashtags(rows))
+        tags = recap.reel_tags(merge_hashtags(recap.hashtags(rows), limit=10))
         media_id, link = InstagramPublisher(settings, db).publish_reel(
             f"posts/recaps/{day}", Path(video).read_bytes(),  # posts/: the prefix the server may write
             recap.caption(rows, date_label, tags, day == local_today()), cover_at_ms=recap.COVER_AT_MS)

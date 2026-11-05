@@ -46,6 +46,19 @@ GENERIC_TAGS = {"news", "worldnews", "breakingnews", "breaking", "latest", "late
                 "updates", "trending", "viral", "headlines", "todaynews", "dailynews", "justnews", "newsalert"}
 TAG_WORDS_MAX = 3  # "USMidterms", "ArtificialIntelligence" yes; "AppleRecordQuarterSales" no
 REVIEW_THRESHOLD = 0.5
+# What a story is about, shown on its slide; the feed's section is only a fallback.
+TOPICS = ["India", "Politics", "Business", "Technology", "AI", "Weather", "Environment", "Health", "Science",
+          "Sports", "Crime", "World"]
+TOPIC_WORDS = [  # first match wins: the keyword fallback when the model gives no topic
+    ("Weather", r"\b(rain|rainfall|cyclone|monsoon|flood|floods|imd|heatwave|heat wave|storm|snowfall|thunderstorm)\b"),
+    ("Environment", r"\b(aqi|air quality|pollution|smog|climate|emissions?|stubble)\b"),
+    ("Health", r"\b(hospital|disease|virus|outbreak|vaccine|dengue|cancer|health|patients?)\b"),
+    ("Sports", r"\b(cricket|ipl|football|match|tournament|olympics?|world cup|test series|odi|t20)\b"),
+    ("Crime", r"\b(arrested|murder|killed|police|fraud|scam|raid|custody|accused)\b"),
+    ("Politics", r"\b(election|elections|minister|bjp|congress|parliament|lok sabha|assembly|president|senate|"
+                 r"democrats|republicans|chief minister|polls?)\b"),
+    ("AI", r"\b(ai|artificial intelligence|openai|chatgpt|gemini|llm)\b"),
+]
 
 SYSTEM_PROMPT = """You write social media posts for "Just News", a neutral news account that shares
 important stories in Technology, AI, Business, Politics and World News.
@@ -68,6 +81,8 @@ For each article you get only its headline, summary, publisher and section. Writ
 - x_hashtag: one hashtag for X only when the story belongs to a big, widely followed event or topic
   that people track by that tag (e.g. "USMidterms", "IPL2026", "COP31", "UnionBudget"); otherwise
   "". Most stories should have none.
+- topic: what the story is about, one of: TOPICS_LIST. The section you are given is the
+  feed's and is often too broad (a rain alert from a business feed is "Weather", not "Business").
 - image_text: 2-8 words for a graphic over the image, at most 50 characters, factual, no punctuation
   at the end.
 - visual: "photo" when a generic photo of a company, product, place, object or public figure in
@@ -101,7 +116,7 @@ first read.
   scheme)", "71,000 cubic feet of water per second" not "71,000 cusecs". Drop legal section numbers
   and say what the law is about. Well-known names (BJP, ISRO, IPL, AI, US) can stay.
 - Simpler words must not change the facts: keep the same people, places, numbers and claims.
-"""
+""".replace("TOPICS_LIST", ", ".join(TOPICS))
 
 REVISE_PROMPT = SYSTEM_PROMPT + """
 You wrote DRAFTS for these articles, and a reviewer sent NOTES: the engagement strategist (about
@@ -130,13 +145,14 @@ RESPONSE_SCHEMA = {
                     "caption": {"type": "string"},
                     "hashtags": {"type": "array", "items": {"type": "string"}},
                     "image_text": {"type": "string"},
+                    "topic": {"type": "string", "enum": TOPICS},
                     "visual": {"type": "string", "enum": ["photo", "graphic"]},
                     "image_query": {"type": "string"},
                     "ig_caption": {"type": "string"},
                     "x_post": {"type": "string"},
                     "x_hashtag": {"type": "string"},
                 },
-                "required": ["id", "headline", "caption", "hashtags", "image_text", "visual", "image_query",
+                "required": ["id", "headline", "caption", "hashtags", "image_text", "topic", "visual", "image_query",
                              "ig_caption", "x_post", "x_hashtag"],
             },
         },
@@ -190,6 +206,13 @@ def _is_fresh(a) -> bool:
     except (TypeError, ValueError, KeyError, IndexError):
         return False
     return (datetime.now(timezone.utc) - published).total_seconds() <= FRESH_HOURS * 3600
+
+
+def topic_of(text: str, section: str) -> str:
+    """The story's topic from its words; the feed's section when nothing matches."""
+    low = text.lower()
+    return next((t for t, pattern in TOPIC_WORDS if re.search(pattern, low)),
+                section if section in TOPICS else "India" if section == "South India" else "World")
 
 
 def normalize_hashtags(raw: list[str], source_text: str = "", publisher: str = "") -> list[str]:
@@ -405,8 +428,9 @@ class ContentCreatorAgent:
             return None
         visual = draft.get("visual") if draft.get("visual") in ("photo", "graphic") else "graphic"
         query = _clip(draft.get("image_query", ""), 60) if visual == "photo" else ""
+        topic = draft.get("topic") if draft.get("topic") in TOPICS else topic_of(source_text, a["category"])
         return {"headline": headline, "caption": caption, "hashtags": hashtags, "image_text": image_text,
-                "attribution": attribution(a["source_name"], a["url"]), "visual": visual if query else "graphic",
+                "topic": topic, "attribution": attribution(a["source_name"], a["url"]), "visual": visual if query else "graphic",
                 "image_query": query, "status": "draft", "review_note": None,
                 "ig_caption": _paragraphs(draft.get("ig_caption", ""), IG_CAPTION_MAX) or None,
                 "x_post": _x_post(draft.get("x_post", "")) or None,
@@ -422,7 +446,7 @@ class ContentCreatorAgent:
             f"SELECT * FROM articles WHERE id IN ({','.join('?' * len(article_ids))})", article_ids)}
         ids = [a for a in article_ids if a in posts and a in rows]
         keys = {f"P{i + 1}": {**dict(rows[a]), "fresh": _is_fresh(rows[a])} for i, a in enumerate(ids)}
-        drafts = {k: {f: posts[a["id"]][f] for f in ("headline", "caption", "image_text", "visual", "image_query",
+        drafts = {k: {f: posts[a["id"]][f] for f in ("headline", "caption", "image_text", "topic", "visual", "image_query",
                                                      "ig_caption", "x_post", "x_hashtag")}
                   | {"hashtags": json.loads(posts[a["id"]]["hashtags"])} for k, a in keys.items()}
         for k, a in keys.items():

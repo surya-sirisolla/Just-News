@@ -3,8 +3,9 @@
 Like a newsroom feed (The Hindu's on X): one post per story, a plain news sentence, rarely a
 hashtag, and posts spaced out (JUSTNEWS_X_SPACING_MINUTES) rather than in a burst. Approved stories
 are queued; `post_due()` (run every 30 seconds by `serve`) posts each one when its time comes:
-  1. POST /2/media/upload with the JPEG (media_category=tweet_image) -> a media id
-  2. POST /2/tweets with the text and that media id -> the live post
+  1. only for a licensed photo: POST /2/media/upload (media_category=tweet_image) -> a media id
+     (X is for text: a story with only a text template is posted as text)
+  2. POST /2/tweets with the text (and the media id) -> the live post
 A queued story not posted within JUSTNEWS_X_QUEUE_MAX_HOURS is dropped instead of posted stale.
 The text carries no link: on X's pay-per-use pricing a post with a URL costs about 13x more, so the
 source is named instead. X also rejects a post whose text matches a recent one, which is a second
@@ -217,10 +218,13 @@ class XPublisher(Publisher):
         return posts
 
     def _publish_one(self, run_id: str, p) -> tuple[str, str]:
-        media = self._call("POST", "media/upload", retries=1, data={"media_category": "tweet_image"},
-                           files={"media": ("post.jpg", to_jpeg(p["image_path"]), "image/jpeg")})["data"]["id"]
+        body = {"text": x_text(p)}
+        if p["image_kind"] == "photo":  # a real licensed photo; a text template adds nothing to a tweet
+            media = self._call("POST", "media/upload", retries=1, data={"media_category": "tweet_image"},
+                               files={"media": ("post.jpg", to_jpeg(p["image_path"]), "image/jpeg")})["data"]["id"]
+            body["media"] = {"media_ids": [media]}
         try:
-            post_id = self._call("POST", "tweets", json={"text": x_text(p), "media": {"media_ids": [media]}})["data"]["id"]
+            post_id = self._call("POST", "tweets", json=body)["data"]["id"]
         except DuplicatePost:
             live = self._find_live(p)
             log.warning("  X says this post already exists%s", f": {live[1]}" if live else "")
