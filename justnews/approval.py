@@ -35,6 +35,9 @@ log = logging.getLogger("justnews.approval")
 STALE_SECONDS = 300  # older messages are only acted on if a shortlist is open
 CONTEXT_HOURS = 48   # how long a finished shortlist stays available for "send me the templates"
 PLATFORM_LABELS = {"instagram": "Instagram", "x": "X"}
+ACK_RE = re.compile(r"^\s*(ok(ay)?|k|kk|thanks?( you)?|thx|ty|tq|great|nice|cool|good|super|awesome|perfect|"
+                    r"got it|fine|noted|done|👍|🙏|❤️|👌|🔥|💯|✅)(\s*(ok(ay)?|thanks?( you)?|👍|🙏|❤️|👌|🔥|💯|✅))*"
+                    r"[\s!.]*$", re.I)
 PREVIEW_MAX = 300   # characters of the Instagram caption shown in the shortlist
 CAPTION_LIMIT = 1000  # WhatsApp image captions are cut around 1024
 SHOW_WORDS = {"list", "show list", "shortlist"}
@@ -79,7 +82,8 @@ class ApprovalService:
     def __init__(self, settings: Settings, db: Database, client, designer: Callable[[str, list[str]], object],
                  owner: str | None = None, assistant=None,
                  publishers: dict[str, Callable[[str, list[str]], object]] | None = None,
-                 researcher: Callable[[str, str], None] | None = None):
+                 researcher: Callable[..., None] | None = None,
+                 editor: Callable[[str, list[str], str], dict[str, str]] | None = None):
         self.settings = settings
         self.db = db
         self.client = client
@@ -88,8 +92,10 @@ class ApprovalService:
         self.assistant = assistant  # free-text understanding; None -> keyword rules only
         # Platform label -> (run_id, article ids) -> PublishResult; empty -> posting not connected.
         self.publishers = publishers or {}
-        # (topic, the owner's words) -> starts an on-demand search that sends its own shortlist.
+        # (topic, the owner's words, owner's instruction) -> starts an on-demand search that sends its own list.
         self.researcher = researcher
+        # (run_id, article ids, the owner's instruction) -> {article id: the writer's reply}: rewrites posts.
+        self.editor = editor
 
     # --- outgoing ---------------------------------------------------------------
     def request(self, run_id: str, title: str | None = None, limit: int | None = None) -> dict:
@@ -107,6 +113,11 @@ class ApprovalService:
 
     def _send(self, text: str) -> None:
         self.client.send_text(self.owner, text)
+
+    def _react(self, msg: Incoming | None, emoji: str) -> None:
+        """An emoji on the owner's message instead of (or before) a text reply."""
+        if msg is not None and hasattr(self.client, "react"):
+            self.client.react(self.owner, msg, emoji)
 
     def _send_shortlist(self, request_id: int, title: str | None = None) -> None:
         req = self.db.approval_request(request_id)
@@ -164,6 +175,7 @@ class ApprovalService:
             items = json.loads(req["items"])
             pending = json.loads(req["pending"]) if req["pending"] else None
             if pending is not None and lower in YES_WORDS:
+                self._react(msg, "👍")
                 return self._approve(req, pending, msg.text)
             if pending is not None and lower in NO_WORDS:
                 self.db.set_pending_approval(req["id"], None)
@@ -174,8 +186,12 @@ class ApprovalService:
                 return "shortlist sent"
             chosen = parse_selection(text, len(items))
             if chosen is not None:  # plain numbers / all / none are unambiguous: act at once
+                self._react(msg, "👍")
                 return self._approve(req, chosen, msg.text)
-        return self._converse(text, req)
+        if ACK_RE.match(text):  # "ok", "thanks", 👍: a heart, no reply and no model call
+            self._react(msg, "❤️")
+            return "acknowledged"
+        return self._converse(text, req, msg)
 
     def _approve(self, req, chosen: list[int], reply_text: str) -> str:
         items = json.loads(req["items"])
@@ -186,7 +202,7 @@ class ApprovalService:
         self.db.set_pending_approval(req["id"], None)
         self.db.set_approval_status(req["id"], "answered", reply=reply_text)
         if not approved:
-            return self._reply("👍 Okay, I'll skip all of these. Nothing will be posted.", "none approved")
+            return "none approved"  # the 👍 on the owner's message says it all
         numbers = _join(chosen)
         result = self.designer(req["run_id"], approved)
         made = getattr(result, "photos", 0) + getattr(result, "graphics", 0)
@@ -251,17 +267,18 @@ class ApprovalService:
                          "template": posts[aid]["image_path"], "caption": posts[aid]["caption"],
                          "hashtags": " ".join(json.loads(posts[aid]["hashtags"])),
                          "instagram_text": instagram_caption(posts[aid]), "x_text": x_text(posts[aid]),
-                         "attribution": posts[aid]["attribution"]}
+                         "attribution": posts[aid]["attribution"], "source": posts[aid]["source_name"]}
                 for n, aid in json.loads(req["items"]).items() if aid in posts}
 
-    def _converse(self, text: str, open_req) -> str:
+    def _converse(self, text: str, open_req, msg: Incoming | None = None) -> str:
         req = self._recent_request(open_req)
         stories = self._stories(req)
         context = {
             "shortlist_open": open_req is not None,
             "waiting_for_yes_on": json.loads(open_req["pending"]) if open_req is not None and open_req["pending"] else None,
             "posting_connected_to": list(self.publishers),
-            "stories": [{"number": n, "headline": s["headline"], "approval": s["approval"],
+            "stories": [{"number": n, "headline": s["headline"], "facts": s["caption"][:300],
+                         "source": s["source"], "approval": s["approval"],
                          "template_ready": bool(s["template"]), "posted_to": s["posted"]}
                         for n, s in stories.items()],
         }
@@ -284,17 +301,37 @@ class ApprovalService:
             return self._reply(reply or "That shortlist is closed now, so I can't add to it. The next one "
                                         "comes with the next news cycle.", "approve after close")
         if intent == "reject_all" and open_req is not None:
+            self._react(msg, "👍")
             return self._approve(open_req, [], text)
+        if intent == "edit":
+            return self._edit(req, stories, numbers, out.get("instruction") or text, msg)
         if intent == "status":
             return self._reply(reply or self._summary(stories), "status")
         if intent == "research":
             query = out.get("query") or text
             if self.researcher is None:
                 return self._reply("I can't search on request here yet.", "research unavailable")
-            self.researcher(query, text)
-            return self._reply(reply or f"On it 🔎 Looking for the latest on {query}. I'll send a list in a minute or two.",
-                               f"research {query!r}")
+            self._react(msg, "👀")  # the list itself is the answer
+            self.researcher(query, text, out.get("instruction") or "")
+            return f"research {query!r}"
         return self._reply(reply or fallback(text)["reply"], f"chat ({intent})")
+
+    def _edit(self, req, stories: dict[int, dict], numbers: list[int], instruction: str, msg) -> str:
+        """The owner's change to listed stories goes to the content creator; the new versions come back."""
+        if self.editor is None or req is None:
+            return self._reply("I can't rewrite stories here yet.", "edit unavailable")
+        if not numbers:
+            return self._reply("Which story should I change? Tell me its number, e.g. *make 2 simpler*.", "edit: which?")
+        self._react(msg, "✍️")
+        items = json.loads(req["items"])
+        replies = self.editor(req["run_id"], [items[str(n)] for n in numbers], instruction)
+        posts = {p["article_id"]: p for p in self.db.posts_for_run(req["run_id"])}
+        for n in numbers:
+            aid = items[str(n)]
+            note = replies.get(aid, "")
+            self._send(f"✏️ *Updated {n}*\n" + self._format_item(str(n), posts[aid]) +
+                       (f"\n\n_Writer: {note}_" if note else ""))
+        return f"edited {numbers}"
 
     def _send_templates(self, stories: dict[int, dict], numbers: list[int], reply: str) -> str:
         ready = {n: s for n, s in stories.items() if s["template"] and Path(s["template"]).exists()}

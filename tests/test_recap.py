@@ -75,6 +75,11 @@ class RecapTests(unittest.TestCase):
         text = recap.caption(rows, "4 Nov 2026", ["#Delhi"])
         self.assertTrue(text.startswith("Today's news in 2 stories (4 Nov 2026):\n\n1. Headline 1\n2. Headline 2"))
 
+    def test_a_past_days_recap_does_not_say_today(self):
+        self.published(self.ids[:2])
+        rows = self.db.published_between(*recap.day_bounds(self.day, "Asia/Kolkata"))
+        self.assertTrue(recap.caption(rows, "4 Nov 2026", [], today=False).startswith("The news of 4 Nov 2026 in 2 stories:"))
+
     def test_day_bounds_are_the_local_day_in_utc(self):
         self.assertEqual(recap.day_bounds("2026-11-04", "Asia/Kolkata"),
                          ("2026-11-03T18:30:00+00:00", "2026-11-04T18:30:00+00:00"))
@@ -106,7 +111,7 @@ class RecapTests(unittest.TestCase):
     def test_skips_a_quiet_day_and_stops_after_three_failures(self):
         self.published(self.ids[:1])
         self.assertEqual(cli.post_recap(self.db, self.day), "skipped: fewer than two stories posted")
-        day = "2026-11-05"
+        day = (datetime.fromisoformat(self.day) + timedelta(days=1)).date().isoformat()  # not today
         with mock.patch.object(cli, "make_recap", side_effect=RuntimeError("encoder broke")):
             for _ in range(3):
                 cli.post_recap(self.db, day)
@@ -129,12 +134,35 @@ class RecapTests(unittest.TestCase):
         out = self.root / "recap.mp4"
         with mock.patch.multiple(recap, INTRO=0.4, STORY=0.4, OUTRO=0.4, PUSH=0.1):
             cover = recap.render(rows, "4 Nov 2026", "just_newzzzz", "Just News", Fonts(), out)
-        self.assertEqual(cover.size, (1080, 1920))
+        self.assertEqual(cover.size, (1080, 1920))  # the cover image stays full size
         import imageio_ffmpeg
         probe = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-i", str(out)], capture_output=True, text=True).stderr
-        self.assertIn("1080x1920", probe)
+        self.assertIn("720x1280", probe)
         self.assertIn("h264", probe)
         self.assertIn("aac", probe)
+
+    def test_encoder_memory_is_bounded(self):
+        cmd = recap.encoder_command(Path("o.mp4"), 37.0)
+        joined = " ".join(cmd)
+        for flag in ("-threads 1", "-thread_queue_size 2", "rc-lookahead=5", "-t 37.00", "-s 720x1280"):
+            self.assertIn(flag, joined)
+        self.assertNotIn("-shortest", cmd)
+
+    def test_a_recap_that_never_finished_is_reported_once(self):
+        stop = threading.Event()
+        day = datetime.now(IST).date().isoformat()
+        self.db.set_state(f"recap:{day}:attempts", "3")  # three attempts, all killed mid-way
+        evening = datetime.now(IST).replace(hour=21, minute=40).astimezone(timezone.utc)
+        ticks = iter(range(3))
+        with mock.patch.object(cli, "utcnow", lambda: evening), mock.patch.object(cli, "Database", return_value=self.db), \
+                mock.patch.object(cli, "post_recap") as post, \
+                mock.patch.object(stop, "wait", side_effect=lambda s: next(ticks, None) is None and stop.set()):
+            cli.daily_recap(stop, every=0)
+        post.assert_not_called()
+        self.assertTrue(self.db.get_state(f"recap:{day}").startswith("failed: no attempt finished"))
+        outbox = [r[0] for r in self.db.conn.execute("SELECT body FROM wa_outbox")]
+        self.assertEqual(len(outbox), 1)
+        self.assertIn("couldn't be made", outbox[0])
 
     def test_reel_goes_to_instagram_as_reels_with_a_cover(self):
         graph, store = FakeGraph(), FakeStore()

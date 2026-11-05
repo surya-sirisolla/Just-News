@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
     sent_at       TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,
     error         TEXT,              -- last failure; given up after the bridge's maximum attempts
-    media_path    TEXT               -- image to send, with `body` as its caption
+    media_path    TEXT,              -- image to send, with `body` as its caption
+    reaction_to   TEXT               -- JSON {id, chat, sender}: `body` is an emoji reaction to that message
 );
 CREATE TABLE IF NOT EXISTS publications (
     article_id    TEXT NOT NULL REFERENCES posts(article_id),
@@ -206,8 +207,10 @@ class Database:
         for column in ("ig_caption", "x_post", "x_hashtag"):  # platform versions
             if column not in post_columns:
                 self.conn.execute(f"ALTER TABLE posts ADD COLUMN {column} TEXT")
-        if "media_path" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}:
-            self.conn.execute("ALTER TABLE wa_outbox ADD COLUMN media_path TEXT")
+        outbox_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(wa_outbox)")}
+        for column in ("media_path", "reaction_to"):
+            if column not in outbox_columns:
+                self.conn.execute(f"ALTER TABLE wa_outbox ADD COLUMN {column} TEXT")
         pub_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(publications)")}
         if "attempts" not in pub_columns:
             self.conn.execute("ALTER TABLE publications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
@@ -371,6 +374,10 @@ class Database:
                  image.get("license_url"), image.get("creator"), image.get("credit"), image.get("note"), _now(),
                  image.get("photo_path")))
 
+    def delete_image(self, article_id: str) -> None:
+        with self.tx() as c:
+            c.execute("DELETE FROM images WHERE article_id = ?", (article_id,))
+
     # --- WhatsApp approval ------------------------------------------------------
     def create_approval_request(self, run_id: str, items: dict[str, str], expires_at: str, status: str) -> int:
         with self.tx() as c:
@@ -440,6 +447,11 @@ class Database:
         with self.tx() as c:
             return c.execute("INSERT INTO wa_outbox(to_number, body, created_at, media_path) VALUES (?, ?, ?, ?)",
                              (to_number, body, _now(), media_path)).lastrowid
+
+    def enqueue_reaction(self, to_number: str, emoji: str, message: dict) -> int:
+        with self.tx() as c:
+            return c.execute("INSERT INTO wa_outbox(to_number, body, created_at, reaction_to) VALUES (?, ?, ?, ?)",
+                             (to_number, emoji, _now(), json.dumps(message))).lastrowid
 
     def pending_messages(self, max_attempts: int = 5) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM wa_outbox WHERE sent_at IS NULL AND attempts < ? ORDER BY id",

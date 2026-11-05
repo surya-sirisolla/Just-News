@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from ..config import Settings
 from ..db import Database
 from ..llm import GeminiClient, LLMError
+from ..plain import draft_notes, summary as plain_summary
 from ..regions import select_mix
 
 log = logging.getLogger("justnews.content")
@@ -87,16 +88,33 @@ For each article you get only its headline, summary, publisher and section. Writ
   ig_caption hook. Follow the PLAYBOOK's X rules.
 Both versions use ONLY facts from the headline or summary, keep the neutral tone, and contain no
 hashtags and no links (they are added separately). The PLAYBOOK never overrides these rules.
+
+PLAIN LANGUAGE, for every field: write so someone who doesn't follow the news understands it on the
+first read.
+- Everyday words, short sentences (at most about 20 words), one idea per sentence, active voice.
+- No newspaper shorthand: not "earmarks, mulls, slams, eyes, nod, curbs, probe, row, amid, sparks,
+  U-turn, plea, apex court, the Centre" but "sets aside, considers, criticises, plans, approval,
+  limits, investigation, dispute, during, leads to, reversal, request to the court, Supreme Court,
+  the central government".
+- Spell out or explain abbreviations and special terms the first time: "Supreme Court" not "SC",
+  "State Election Commission" not "SEC", "Agniveers (soldiers hired under the four-year Agnipath
+  scheme)", "71,000 cubic feet of water per second" not "71,000 cusecs". Drop legal section numbers
+  and say what the law is about. Well-known names (BJP, ISRO, IPL, AI, US) can stay.
+- Simpler words must not change the facts: keep the same people, places, numbers and claims.
 """
 
 REVISE_PROMPT = SYSTEM_PROMPT + """
 You wrote DRAFTS for these articles, and a reviewer sent NOTES: the engagement strategist (about
-form) or the fact checker (about facts not in the source). Rewrite each draft following the notes
+form), the plain-language editor (hard words, unexplained abbreviations, long sentences), the fact
+checker (about facts not in the source), or the owner (their wishes on wording, length and what to
+lead with; if they ask for a fact or figure the headline and summary don't state, leave it out and
+say so in `reply`, suggesting they ask for a search for a report that has it). Rewrite each draft following the notes
 where they fit the facts; for a fact-check note, remove or rephrase whatever the headline and
 summary do not state, in every field. If a note would need facts the source does not give, or would
 break a rule above, keep that part and say why in `reply`. `reply` is one short sentence to the
 reviewer about what you changed."""
 FACT_CHECKER = "fact-checker"  # Jev, in the discussion
+EDITOR = "plain-language editor"  # plain.py, in the discussion
 ALSO_COVERED_RE = re.compile(r"\s*Also covered by:.*$", re.S)
 
 RESPONSE_SCHEMA = {
@@ -242,10 +260,12 @@ class ContentCreatorAgent:
         return JevScorer(self.settings.typesafe_api_key, "jev-1.14.0", 0.042)
 
     # --- public entry point -------------------------------------------------
-    def run(self, run_id: str, limit: int | None = None, mix: bool = True) -> ContentResult:
+    def run(self, run_id: str, limit: int | None = None, mix: bool = True, guidance: str = "") -> ContentResult:
         """Posts for the run's recommended stories: by default the India-first mix of
-        `max_posts_per_run` (regions.py); on-demand research takes the best `limit` as they are."""
+        `max_posts_per_run` (regions.py); on-demand research takes the best `limit` as they are.
+        `guidance` is the owner's note for this batch (e.g. what to lead with)."""
         result = ContentResult(run_id)
+        self.guidance = guidance
         limit = limit or self.settings.max_posts_per_run
         candidates = self.db.recommended_without_post(run_id, 500)
         if mix:
@@ -264,6 +284,13 @@ class ContentCreatorAgent:
                 notes = self.strategist.review(run_id, keys, drafts)
                 if notes:
                     drafts.update(self._revise(run_id, keys, drafts, notes))
+            if drafts:  # hard words and long sentences get one rewrite (a free check; a model call only if needed)
+                plain = {k: draft_notes(d) for k, d in drafts.items()}
+                plain = {k: f"Make it plain: {plain_summary(n)}." for k, n in plain.items() if n}
+                for k, note in plain.items():
+                    self.db.add_agent_message(run_id, EDITOR, self.name, note, keys[k]["id"])
+                if plain:
+                    drafts.update(self._revise(run_id, keys, drafts, plain, reviewer=EDITOR))
             reviews = self._verify(keys, drafts) if drafts else {}
             if reviews:  # the fact checker's notes get one revision round too, then a second check
                 for k, note in reviews.items():
@@ -313,9 +340,15 @@ class ContentCreatorAgent:
                  "summary": ALSO_COVERED_RE.sub("", a["description"] or "")[:400], "fresh": a["fresh"]}
                 for k, a in keys.items()]
 
+    def _owner_note(self) -> str:
+        note = getattr(self, "guidance", "")
+        return (f"OWNER'S NOTE (follow it for what to lead with and how to word it, but state only facts in "
+                f"each article's headline or summary):\n{note}\n\n") if note else ""
+
     def _write(self, keys: dict, result: ContentResult) -> tuple[dict[str, dict], str]:
         playbook = {k: v for k, v in self._playbook().items() if k in ("instagram", "x")}
-        prompt = ("PLAYBOOK (from the engagement strategist):\n" + json.dumps(playbook, ensure_ascii=False) +
+        prompt = (self._owner_note() + "PLAYBOOK (from the engagement strategist):\n" +
+                  json.dumps(playbook, ensure_ascii=False) +
                   "\n\nARTICLES:\n" + json.dumps(self._items(keys), ensure_ascii=False, indent=0))
         deadline = time.monotonic() + self.settings.gemini_content_time_budget
         for client in self.clients:
@@ -340,7 +373,8 @@ class ContentCreatorAgent:
         items = [{**item, "draft": {f: drafts[item["id"]].get(f) for f in RESPONSE_SCHEMA["properties"]["posts"]
                                     ["items"]["properties"] if f != "id"}, "notes": notes[item["id"]]}
                  for item in self._items({k: keys[k] for k in notes if k in drafts})]
-        prompt = ("PLAYBOOK (from the engagement strategist):\n" + json.dumps(playbook, ensure_ascii=False) +
+        prompt = (self._owner_note() + "PLAYBOOK (from the engagement strategist):\n" +
+                  json.dumps(playbook, ensure_ascii=False) +
                   "\n\nDRAFTS AND NOTES:\n" + json.dumps(items, ensure_ascii=False, indent=0))
         for client in self.clients:
             try:
@@ -378,6 +412,48 @@ class ContentCreatorAgent:
                 "x_post": _x_post(draft.get("x_post", "")) or None,
                 "x_hashtag": next(iter(normalize_hashtags([draft.get("x_hashtag") or ""], source_text,
                                                           a["source_name"])), None)}
+
+    # --- the owner's changes to written posts --------------------------------------------
+    def revise_posts(self, run_id: str, article_ids: list[str], instruction: str) -> dict[str, str]:
+        """One rewrite of posts already written, with the owner's words as the note, then Jev's fact
+        check. Returns the writer's reply per article (e.g. why a requested figure was left out)."""
+        posts = {p["article_id"]: p for p in self.db.posts_for_run(run_id)}
+        rows = {r["id"]: r for r in self.db.conn.execute(
+            f"SELECT * FROM articles WHERE id IN ({','.join('?' * len(article_ids))})", article_ids)}
+        ids = [a for a in article_ids if a in posts and a in rows]
+        keys = {f"P{i + 1}": {**dict(rows[a]), "fresh": _is_fresh(rows[a])} for i, a in enumerate(ids)}
+        drafts = {k: {f: posts[a["id"]][f] for f in ("headline", "caption", "image_text", "visual", "image_query",
+                                                     "ig_caption", "x_post", "x_hashtag")}
+                  | {"hashtags": json.loads(posts[a["id"]]["hashtags"])} for k, a in keys.items()}
+        for k, a in keys.items():
+            self.db.add_agent_message(run_id, "owner", self.name, instruction, a["id"])
+        revised = self._revise(run_id, keys, drafts, {k: f"The owner asks: {instruction}" for k in keys},
+                               reviewer="owner")
+        if not revised:
+            return {a: "I couldn't rewrite it right now (no model answered); try again in a minute." for a in ids}
+        merged = {k: {**drafts[k], **d} for k, d in revised.items()}
+        reviews = self._verify({k: keys[k] for k in merged}, merged)
+        replies = {}
+        for k, d in merged.items():
+            aid, old = keys[k]["id"], posts[keys[k]["id"]]
+            post = self._finalize(d, keys[k])
+            if post is None:
+                replies[aid] = "The rewrite came back incomplete, so I kept the old version."
+                continue
+            if k in reviews:
+                post["status"], post["review_note"] = "needs_review", reviews[k]
+            self.db.save_post(run_id, aid, post, old["model"])
+            if old["approval"]:
+                self.db.set_post_approval([aid], old["approval"])
+            if (post["headline"], post["image_text"]) != (old["headline"], old["image_text"]):
+                self.db.delete_image(aid)  # the template shows the old text: it is designed again
+            replies[aid] = " ".join(str(d.get("reply") or "").split())[:300]
+        self._record_usage(run_id)
+        return replies
+
+    def _record_usage(self, run_id: str) -> None:
+        for u in [c.usage.as_dict() for c in self.clients if c.usage.calls or c.usage.failed_calls]:
+            self.db.record_llm_usage(run_id, f"{self.name}:{u['model']}", u)
 
     # --- verification -------------------------------------------------------
     def _verify(self, keys: dict, drafts: dict[str, dict]) -> dict[str, str]:

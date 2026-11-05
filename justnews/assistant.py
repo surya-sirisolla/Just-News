@@ -16,7 +16,7 @@ from .llm import LLMError
 
 log = logging.getLogger("justnews.assistant")
 
-INTENTS = ["approve", "send_templates", "show_shortlist", "reject_all", "status", "research", "chat"]
+INTENTS = ["approve", "send_templates", "show_shortlist", "reject_all", "status", "research", "edit", "chat"]
 
 SYSTEM_PROMPT = """You are the Just News assistant, chatting on WhatsApp with the account owner,
 who decides which news stories get a designed template (image) and get posted.
@@ -39,13 +39,21 @@ Choose one intent:
 - reject_all: they want none of the stories.
 - status: they ask what's going on, what's pending, or what's ready.
 - research: they ask you to look up news on a topic ("research on AQI today", "any news on
-  Chennai rains?", "find the latest on ISRO"). Put the topic in `query`: 1-6 words, without time
-  words like "today". In `reply`, say you're on it; the app searches and sends a numbered list.
+  Chennai rains?", "find the latest on ISRO"), or they say a story's fact is wrong or out of date
+  and want the news that has their figure ("it's 600+, I checked, post that news"). Put the topic
+  in `query`: 1-6 words, without time words, including any figure they mention ("Delhi AQI 600").
+  Put what they want the post to lead with in `instruction` ("Lead with the AQI above 600").
+  The app searches and sends a numbered list; never state their figure as fact yourself.
+- edit: they want a listed story's post changed: wording, length, simpler words, what to lead
+  with, a detail the story already has ("make 2 simpler", "mention Hyderabad in 1", "shorter
+  headline for 3"). Put the story numbers in `numbers` and their request in `instruction`.
 - chat: anything else (greetings, thanks, questions). Answer helpfully, and mention that they can
   reply with story numbers or ask for templates when that helps.
 
 `reply` is the message to send back. For send_templates, write a short line to go before the
-images. For approve, write nothing important: the app writes the confirmation question."""
+images. For approve, research and edit, write nothing important: the app answers itself.
+Each story in CONTEXT has its facts and source: answer questions about a story from those, and say
+so when the owner's information differs from what the source reports."""
 
 SCHEMA = {
     "type": "object",
@@ -54,13 +62,15 @@ SCHEMA = {
         "numbers": {"type": "array", "items": {"type": "integer"}},
         "reply": {"type": "string"},
         "query": {"type": "string"},
+        "instruction": {"type": "string"},
     },
-    "required": ["intent", "numbers", "reply", "query"],
+    "required": ["intent", "numbers", "reply", "query", "instruction"],
 }
 
 TEMPLATE_WORDS = re.compile(r"\b(template|templates|image|images|pic|pics|picture|photo|design|designs|send)\b", re.I)
 LIST_WORDS = re.compile(r"\b(list|stories|news|shortlist|options)\b", re.I)
 STATUS_WORDS = re.compile(r"\b(status|pending|ready|done|update)\b", re.I)
+EDIT_WORDS = re.compile(r"\b(make|change|rewrite|reword|edit|shorter|simpler|simplify|mention|add|remove)\b", re.I)
 RESEARCH_WORDS = re.compile(r"\b(research|search|look up|find|any news|news on|news about|latest on)\b", re.I)
 QUERY_NOISE = re.compile(
     r"\b(can you|could you|please|pls|do (a |some )?|research(ing)?|search(ing)?( for)?|look up|find( me)?|"
@@ -77,6 +87,8 @@ def clean_query(text: str) -> str:
 def fallback(text: str) -> dict:
     """Keyword rules, used when no Gemini model is available."""
     numbers = [int(n) for n in re.findall(r"\d+", text)]
+    if numbers and EDIT_WORDS.search(text):
+        return {"intent": "edit", "numbers": numbers, "instruction": text, "reply": ""}
     if RESEARCH_WORDS.search(text):
         query = clean_query(text)
         return {"intent": "research", "numbers": [], "query": query,
@@ -110,5 +122,5 @@ class Assistant:
                 if out["intent"] == "research" and not query:
                     query = clean_query(text)
                 return {"intent": out["intent"], "numbers": numbers, "reply": str(out.get("reply") or "")[:1000],
-                        "query": query}
+                        "query": query, "instruction": " ".join(str(out.get("instruction") or "").split())[:300]}
         return fallback(text)

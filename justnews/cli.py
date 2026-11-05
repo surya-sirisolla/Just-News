@@ -129,6 +129,10 @@ class ConsoleClient:
         print(f"\n----- WhatsApp image: {path} -----\n{caption}\n----------------------------")
         return f"console-{uuid.uuid4().hex[:12]}"
 
+    def react(self, to: str, message, emoji: str) -> str:
+        print(f"\n----- WhatsApp reaction {emoji} on your message: {message.text[:60]!r} -----")
+        return f"console-{uuid.uuid4().hex[:12]}"
+
 
 def make_publishers(db: Database, immediate: bool = False) -> list[Publisher]:
     """Every platform whose keys are set, in the order posts go out. X queues its posts (spaced out)
@@ -151,12 +155,17 @@ def approval_service(db: Database) -> ApprovalService:
                                             min_interval=settings.gemini_min_interval, temperature=0.6,
                                             timeout=20, retries=0) for m in settings.gemini_chat_models])
     publishers = {p.label: (lambda run_id, ids, p=p: p.publish(run_id, ids)) for p in make_publishers(db)}
+
+    def editor(run_id: str, article_ids: list[str], instruction: str) -> dict[str, str]:
+        return ContentCreatorAgent(settings, db).revise_posts(run_id, article_ids, instruction)
+
     if settings.whatsapp_enabled:
         return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publishers=publishers,
-                               researcher=start_research)
+                               researcher=start_research, editor=editor)
     log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
     return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant,
-                           publishers=publishers, researcher=lambda query, text: research_job(query, text, db))
+                           publishers=publishers, editor=editor,
+                           researcher=lambda query, text, instruction="": research_job(query, text, db, instruction))
 
 
 def research_window(text: str) -> str:
@@ -166,7 +175,7 @@ def research_window(text: str) -> str:
     return "2d" if re.search(r"\byesterday\b", text, re.I) else "1d"
 
 
-def research(db: Database, query: str, window: str = "1d") -> str:
+def research(db: Database, query: str, window: str = "1d", guidance: str = "") -> str:
     """On-demand research: Google News (India edition) for the query, scored with a fresh look,
     then posts for the best few. Returns the run ID; the stories wait for approval as usual."""
     run_id = f"{new_run_id()}-research"
@@ -178,7 +187,7 @@ def research(db: Database, query: str, window: str = "1d") -> str:
     picked = [r["article_id"] for r in db.evaluations_for_run(run_id) if r["decision"] == "Recommended"]
     picked = on_topic(db, run_id, picked, query)
     db.adopt_posts(run_id, picked)  # stories written before (e.g. in a skipped list) are offered again
-    ContentCreatorAgent(settings, db).run(run_id, limit=settings.research_max_posts, mix=False)
+    ContentCreatorAgent(settings, db).run(run_id, limit=settings.research_max_posts, mix=False, guidance=guidance)
     return run_id
 
 
@@ -205,12 +214,12 @@ def on_topic(db: Database, run_id: str, article_ids: list[str], query: str) -> l
     return [aid for aid in article_ids if aid in keep]
 
 
-def research_job(query: str, text: str, db: Database | None = None) -> dict:
+def research_job(query: str, text: str, db: Database | None = None, instruction: str = "") -> dict:
     """Search, then send the shortlist (or say nothing was found) to the owner."""
     db = db or Database(settings.db_path)  # a background thread uses its own connection
     service = approval_service(db)
     try:
-        run_id = research(db, query, research_window(text))
+        run_id = research(db, query, research_window(text), instruction)
         topic = query.upper() if query.isalpha() and len(query) <= 4 else query[:1].upper() + query[1:]  # "AQI"
         result = service.request(run_id, title=f"🔎 *{topic}*", limit=settings.research_max_posts)
         if not result.get("requested"):
@@ -223,9 +232,9 @@ def research_job(query: str, text: str, db: Database | None = None) -> dict:
         return {"error": str(exc)}
 
 
-def start_research(query: str, text: str) -> None:
+def start_research(query: str, text: str, instruction: str = "") -> None:
     """Runs in the background, so the WhatsApp bot keeps answering while it searches."""
-    threading.Thread(target=research_job, args=(query, text), name="research", daemon=True).start()
+    threading.Thread(target=research_job, args=(query, text, None, instruction), name="research", daemon=True).start()
 
 
 def cmd_research(db: Database, args) -> str:
@@ -345,7 +354,7 @@ def make_recap(db: Database, day: str, out_dir) -> tuple[list, str, object] | No
     handle = InstagramPublisher(settings, db)._handle_name() if settings.instagram_enabled else ""
     video = out_dir / f"recap-{day}.mp4"
     cover = recap.render(rows, date_label, handle, settings.brand_name, Fonts(settings.font_bold, settings.font_regular),
-                         video)
+                         video, today=day == local_today())
     return rows, str(video), cover
 
 
@@ -367,7 +376,7 @@ def post_recap(db: Database, day: str) -> str:
         date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
         tags = merge_hashtags(recap.hashtags(rows))
         media_id, link = InstagramPublisher(settings, db).publish_reel(
-            f"recaps/{day}", Path(video).read_bytes(), cover, recap.caption(rows, date_label, tags))
+            f"recaps/{day}", Path(video).read_bytes(), cover, recap.caption(rows, date_label, tags, day == local_today()))
     except Exception as exc:
         log.exception("Daily recap failed (attempt %d)", tries)
         if tries >= RECAP_ATTEMPTS:
@@ -375,8 +384,13 @@ def post_recap(db: Database, day: str) -> str:
             notify(f"Today's recap Reel couldn't be posted ({type(exc).__name__}: {str(exc)[:120]}).")
         return f"failed: {exc}"
     db.set_state(key, link or media_id)
-    notify(f"🎬 Today's recap Reel is up: {len(rows)} stories in one video.\n{link}")
+    which = "Today's" if day == local_today() else f"The {date_label}"
+    notify(f"🎬 {which} recap Reel is up: {len(rows)} stories in one video.\n{link}")
     return f"posted {link}"
+
+
+def local_today() -> str:
+    return utcnow().astimezone(ZoneInfo(settings.timezone)).date().isoformat()
 
 
 def recap_due(now_local: datetime, recap_time: str) -> bool:
@@ -396,9 +410,15 @@ def daily_recap(stop: threading.Event, every: float = 60.0) -> None:
         try:
             local = utcnow().astimezone(ZoneInfo(settings.timezone))
             day = local.date().isoformat()
-            if recap_due(local, settings.recap_time) and not db.get_state(f"recap:{day}") \
-                    and int(db.get_state(f"recap:{day}:attempts") or 0) < RECAP_ATTEMPTS:
-                log.info("Daily recap for %s: %s", day, post_recap(db, day))
+            attempts = int(db.get_state(f"recap:{day}:attempts") or 0)
+            if recap_due(local, settings.recap_time) and not db.get_state(f"recap:{day}"):
+                if attempts < RECAP_ATTEMPTS:
+                    log.info("Daily recap for %s: %s", day, post_recap(db, day))
+                else:  # every attempt ended without a result: the process died mid-way (e.g. out of memory)
+                    db.set_state(f"recap:{day}", "failed: no attempt finished (the process stopped)")
+                    if settings.whatsapp_enabled:
+                        OutboxClient(db).send_text(settings.whatsapp_owner, "Today's recap Reel couldn't be made: "
+                                                   "the server stopped while making the video. I've logged it.")
         except Exception:
             log.exception("Daily recap check failed")
         stop.wait(every)

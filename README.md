@@ -344,6 +344,22 @@ Instagram as a Reel, then sends the link on WhatsApp.
 - **By hand:** `python -m justnews recap --dry-run` makes the video without posting;
   `python -m justnews recap` posts it (once per day).
 
+## Talking to the bot
+
+- **Reactions instead of replies:** numbers or *yes* get 👍 at once (the links follow when posted),
+  *none* only 👍, "ok"/"thanks"/👍/🙏 a ❤️ with no reply and no model call, "research on …" 👀 (the
+  list is the answer), an edit ✍️. Every message gets blue ticks, and "typing…" shows while the bot
+  works on a reply that takes more than a moment.
+- **Your changes go to the writer:** "make 2 simpler", "mention Hyderabad in 1", "shorter headline
+  for 3" send your words to the content creator as the owner's note; the rewritten story comes back
+  (Jev checks it again), with the writer's reply when it couldn't do something. It never puts in a
+  fact or figure the source doesn't report: say "it's 600+, post that news" and the bot searches for
+  a report with that figure instead, and the writer leads with it if the source has it.
+- **Plain language:** every post is written for someone who doesn't follow the news
+  (`justnews/plain.py`): everyday words, short sentences, abbreviations spelled out ("Supreme
+  Court", not "SC"). A free check flags newspaper shorthand, unexplained terms (SEC, Agniveers,
+  cusecs, POCSO…), legal section numbers and long sentences; flagged posts get one rewrite.
+
 ## Research on request
 
 Ask the bot on WhatsApp, e.g. "research on AQI today", "any news on Chennai rains?" or "find

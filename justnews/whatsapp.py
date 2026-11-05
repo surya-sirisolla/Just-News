@@ -15,6 +15,7 @@ the `wa_outbox` table, and the bridge sends them.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -27,6 +28,8 @@ log = logging.getLogger("justnews.whatsapp")
 
 MAX_TEXT = 4096          # keep messages a readable size; long shortlists are split
 SEND_GAP_SECONDS = 1.5   # pause between messages, so the account looks human
+TYPING_SECONDS = 1.0     # "typing…" shown before each text message
+TYPING_DELAY = 1.5       # quick answers (a reaction) never show "typing…"
 MAX_ATTEMPTS = 5
 
 
@@ -40,6 +43,8 @@ class Incoming:
     sender: str      # phone number, digits only
     text: str
     timestamp: int
+    chat: str = ""        # "user@server" of the chat and the sender, to react to this message
+    sender_jid: str = ""
 
 
 class OutboxClient:
@@ -53,6 +58,19 @@ class OutboxClient:
 
     def send_image(self, to: str, path: str, caption: str) -> str:
         return str(self.db.enqueue_message(to, caption, media_path=path))
+
+    def react(self, to: str, message: Incoming, emoji: str) -> str:
+        """An emoji reaction to one of the owner's messages (👍 for "got it", ❤️ for thanks, 👀 for "looking")."""
+        return str(self.db.enqueue_reaction(to, emoji, {"id": message.message_id, "chat": message.chat,
+                                                         "sender": message.sender_jid}))
+
+
+def to_jid(address: str, fallback: str):
+    """"user@server" (or a phone number) -> a neonize JID."""
+    from neonize.utils import build_jid
+
+    user, _, server = (address or fallback).partition("@")
+    return build_jid(user, server or "s.whatsapp.net")
 
 
 def message_text(msg) -> str:
@@ -85,7 +103,8 @@ def incoming_from_owner(msg, owner: str, resolve_lid: Callable | None = None) ->
     text = message_text(msg).strip()
     if not text:
         return None
-    return Incoming(msg.Info.ID, owner, text, int(msg.Info.Timestamp or 0))
+    return Incoming(msg.Info.ID, owner, text, int(msg.Info.Timestamp or 0),
+                    chat=f"{src.Chat.User}@{src.Chat.Server}", sender_jid=f"{src.Sender.User}@{src.Sender.Server}")
 
 
 class WhatsAppBridge:
@@ -108,10 +127,44 @@ class WhatsAppBridge:
     def _handle_inbox(self) -> None:
         while True:
             msg = self.inbox.get()
+            self._mark_read(msg)
+            done = threading.Event()
+            threading.Thread(target=self._typing_until, args=(msg, done), name="wa-typing", daemon=True).start()
             try:  # designing images takes a while; this keeps WhatsApp's event thread free
                 log.info("Owner said %r -> %s", msg.text[:40], self.on_message(msg))
             except Exception:
                 log.exception("Failed to handle a WhatsApp message")
+            finally:
+                done.set()
+
+    def _mark_read(self, msg: Incoming) -> None:
+        """Blue ticks on the owner's message."""
+        from neonize.utils.enum import ReceiptType
+
+        try:
+            self.client.mark_read(msg.message_id, chat=to_jid(msg.chat, self.owner),
+                                  sender=to_jid(msg.sender_jid, self.owner), receipt=ReceiptType.READ)
+        except Exception as exc:  # cosmetic; never block the reply
+            log.debug("mark_read failed: %s", exc)
+
+    def _typing(self, chat, on: bool) -> None:
+        from neonize.utils.enum import ChatPresence, ChatPresenceMedia
+
+        state = ChatPresence.CHAT_PRESENCE_COMPOSING if on else ChatPresence.CHAT_PRESENCE_PAUSED
+        try:
+            self.client.send_chat_presence(chat, state, ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
+        except Exception as exc:
+            log.debug("typing indicator failed: %s", exc)
+
+    def _typing_until(self, msg: Incoming, done: threading.Event) -> None:
+        """"typing…" while a message is being handled; WhatsApp drops it after ~25 s, so it is renewed."""
+        if done.wait(TYPING_DELAY):
+            return
+        chat = to_jid(msg.chat, self.owner)
+        while not done.is_set():
+            self._typing(chat, True)
+            done.wait(10)
+        self._typing(chat, False)
 
     def send_pending(self, gap: float = SEND_GAP_SECONDS) -> int:
         """Send every queued message once; failures are retried on later passes. Returns how many were sent."""
@@ -124,11 +177,19 @@ class WhatsAppBridge:
                 log.error("Refused to send WhatsApp message %d to a number other than the owner", row["id"])
                 continue
             try:
-                if row["media_path"]:
-                    self.client.send_image(build_jid(row["to_number"]), Path(row["media_path"]).read_bytes(),
-                                           caption=row["body"])
+                to = build_jid(row["to_number"])
+                if row["reaction_to"]:
+                    ref = json.loads(row["reaction_to"])
+                    chat = to_jid(ref.get("chat"), row["to_number"])
+                    self.client.send_message(chat, self.client.build_reaction(
+                        chat, to_jid(ref.get("sender"), row["to_number"]), ref["id"], row["body"]))
+                elif row["media_path"]:
+                    self.client.send_image(to, Path(row["media_path"]).read_bytes(), caption=row["body"])
                 else:
-                    self.client.send_message(build_jid(row["to_number"]), row["body"])
+                    if gap:  # "typing…" first, like a person (skipped when sending without pauses)
+                        self._typing(to, True)
+                        time.sleep(TYPING_SECONDS)
+                    self.client.send_message(to, row["body"])
                 self.db.mark_message_sent(row["id"])
                 sent += 1
                 log.info("Sent WhatsApp message %d (%d chars)", row["id"], len(row["body"]))
@@ -182,6 +243,11 @@ class WhatsAppBridge:
         @client.event(ConnectedEv)
         def _connected(_, __) -> None:
             log.info("WhatsApp connected; approvals are accepted only from %s", self.owner)
+            try:  # "online", so the owner sees "typing…"
+                from neonize.utils.enum import Presence
+                client.send_presence(Presence.AVAILABLE)
+            except Exception as exc:
+                log.debug("presence failed: %s", exc)
             self.ready.set()
 
         @client.event(LoggedOutEv)

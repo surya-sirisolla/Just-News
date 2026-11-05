@@ -233,7 +233,9 @@ def event(text, sender=jid(OWNER), chat=None, alt=None, from_me=False, group=Fal
 
 class BridgeTests(Base):
     def test_only_direct_text_from_owner_is_accepted(self):
-        self.assertEqual(incoming_from_owner(event("1 3"), OWNER), Incoming("ABC123", OWNER, "1 3", 1762156800))
+        self.assertEqual(incoming_from_owner(event("1 3"), OWNER),
+                         Incoming("ABC123", OWNER, "1 3", 1762156800, chat=f"{OWNER}@s.whatsapp.net",
+                                  sender_jid=f"{OWNER}@s.whatsapp.net"))
         self.assertIsNone(incoming_from_owner(event("1 3", sender=jid("15550000000")), OWNER))
         self.assertIsNone(incoming_from_owner(event("1 3", from_me=True), OWNER))
         self.assertIsNone(incoming_from_owner(event("1 3", group=True, chat=jid("1203630", "g.us")), OWNER))
@@ -283,6 +285,23 @@ class BridgeTests(Base):
         self.assertEqual(sent, [(OWNER, "first"), (OWNER, "image:5:caption"), (OWNER, "second")])
         blocked = self.db.conn.execute("SELECT error FROM wa_outbox WHERE to_number = '15550000000'").fetchone()[0]
         self.assertIn("not the owner", blocked)
+
+    def test_bridge_sends_reactions_to_the_owners_message(self):
+        sent = []
+
+        class FakeClient:
+            def build_reaction(self, chat, sender, message_id, emoji):
+                return ("reaction", chat.User, chat.Server, sender.User, message_id, emoji)
+
+            def send_message(self, to, message):
+                sent.append(message)
+
+        bridge = WhatsAppBridge(self.root / "s.sqlite3", OWNER, self.db, lambda m: "", self.root / "hb", self.root / "qr.png")
+        bridge.client = FakeClient()
+        msg = Incoming("MSG1", OWNER, "1 3", 0, chat="12345@lid", sender_jid="12345@lid")
+        OutboxClient(self.db).react(OWNER, msg, "👍")
+        self.assertEqual(bridge.send_pending(gap=0), 1)
+        self.assertEqual(sent, [("reaction", "12345", "lid", "12345", "MSG1", "👍")])  # reacts in the chat it came from
 
 
 if __name__ == "__main__":

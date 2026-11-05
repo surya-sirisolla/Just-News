@@ -71,12 +71,13 @@ class ResearchQueryTests(unittest.TestCase):
 class ResearchConversationTests(Base):
     def test_research_request_starts_a_search_and_answers_at_once(self):
         asked = []
-        self.service.researcher = lambda query, text: asked.append((query, text))
+        self.service.researcher = lambda query, text, instruction: asked.append((query, text, instruction))
         self.service.assistant = mock.Mock(interpret=lambda text, ctx: {
-            "intent": "research", "numbers": [], "query": "AQI", "reply": "On it! Checking today's AQI news 🔎"})
-        self.assertEqual(self.say("research on aqi today"), "research 'AQI'")
-        self.assertEqual(asked, [("AQI", "research on aqi today")])
-        self.assertEqual(self.outbox()[-1], "On it! Checking today's AQI news 🔎")
+            "intent": "research", "numbers": [], "query": "Delhi AQI 600",
+            "instruction": "Lead with the 600+ reading", "reply": "On it!"})
+        self.assertEqual(self.say("it is 600+, post that news"), "research 'Delhi AQI 600'")
+        self.assertEqual(asked, [("Delhi AQI 600", "it is 600+, post that news", "Lead with the 600+ reading")])
+        self.assertEqual(self.outbox(), ["👀"])  # a reaction, then the list itself is the answer
 
     def test_research_shortlist_has_its_own_title(self):
         self.service.request("r1", title="🔎 *AQI*", limit=2)
@@ -159,7 +160,7 @@ class FreshLookTests(unittest.TestCase):
         with mock.patch.object(cli, "approval_service", return_value=service), \
                 mock.patch.object(cli, "research", return_value="run-research") as run:
             cli.research_job("AQI", "research on aqi this week", self.db)
-        run.assert_called_once_with(self.db, "AQI", "7d")
+        run.assert_called_once_with(self.db, "AQI", "7d", "")
         service.request.assert_called_once_with("run-research", title="🔎 *AQI*", limit=Settings().research_max_posts)
         with mock.patch.object(cli, "approval_service", return_value=service), \
                 mock.patch.object(cli, "research", return_value="run-research"):

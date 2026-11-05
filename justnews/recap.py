@@ -3,7 +3,7 @@
 An intro card, about 3.5 seconds per story (its licensed photo with a slow zoom, or its short text on
 its category colour; headline, one fact, source), and a closing "Follow" card. Slides push in from
 the right; story-style bars at the top show progress. Pillow draws the frames and the ffmpeg build
-bundled with `imageio-ffmpeg` encodes them, with a silent audio track (Instagram's API can't add
+bundled with `imageio-ffmpeg` encodes them at 720x1280 with bounded memory, with a silent audio track (Instagram's API can't add
 music from its library). No models are involved.
 """
 
@@ -21,6 +21,7 @@ from .carousel import DARK, GREY, RED, WHITE, _cover_crop, _darken_bottom, _line
 from .graphics import CATEGORY_COLORS, DEFAULT_COLOR, Fonts
 
 W, H, FPS = 1080, 1920, 30
+OUT_W, OUT_H = 720, 1280  # encoded size: a standard Reel size that fits the server's memory (2 GB, no swap)
 LEFT, RIGHT = 72, 960            # Instagram's buttons cover the right edge
 INTRO, STORY, OUTRO, PUSH = 2.5, 3.5, 3.0, 0.3  # seconds
 TOP_H = 900                      # photo / colour band height
@@ -39,10 +40,12 @@ def pick(rows: list, limit: int) -> list:
     return sorted(best, key=lambda r: (r["posted_at"], r["posted_seq"]))
 
 
-def caption(rows: list, date_label: str, tags: list[str]) -> str:
+def caption(rows: list, date_label: str, tags: list[str], today: bool = True) -> str:
     sources = list(dict.fromkeys(r["source_name"] for r in rows))
     credits = list(dict.fromkeys(r["image_credit"] for r in rows if r["photo_path"] and r["image_credit"]))
-    parts = [f"Today's news in {len(rows)} stories ({date_label}):",
+    opening = f"Today's news in {len(rows)} stories ({date_label}):" if today \
+        else f"The news of {date_label} in {len(rows)} stories:"
+    parts = [opening,
              "\n".join(f"{i}. {r['headline']}" for i, r in enumerate(rows, 1)), " ".join(tags),
              "Sources: " + ", ".join(sources)]
     if credits:
@@ -81,12 +84,12 @@ def _static(img: Image.Image):
     return lambda p: img
 
 
-def intro(count: int, date_label: str, brand: str, fonts: Fonts) -> Segment:
+def intro(count: int, date_label: str, brand: str, fonts: Fonts, today: bool = True) -> Segment:
     bg = Image.new("RGB", (W, H), DARK)
     layer, d = _text_layer()
     d.text((LEFT, 300), brand.upper(), font=fonts.get(48, bold=True), fill=WHITE)
     bf = fonts.get(60, bold=True)
-    label = "TODAY'S NEWS"
+    label = "TODAY'S NEWS" if today else "THE DAY'S NEWS"
     d.rectangle([0, 700, LEFT + d.textlength(label, font=bf) + 110, 810], fill=RED)
     d.ellipse([LEFT, 737, LEFT + 34, 771], fill=WHITE)
     d.text((LEFT + 58, 722), label, font=bf, fill=WHITE)
@@ -141,10 +144,11 @@ def story(r, n: int, total: int, fonts: Fonts) -> Segment:
     return Segment(STORY, background, layer)
 
 
-def outro(handle: str, brand: str, fonts: Fonts) -> Segment:
+def outro(handle: str, brand: str, fonts: Fonts, today: bool = True) -> Segment:
     bg = Image.new("RGB", (W, H), DARK)
     layer, d = _text_layer()
-    d.text((LEFT, 700), "That's today's news.", font=fonts.get(80, bold=True), fill=WHITE)
+    d.text((LEFT, 700), "That's today's news." if today else "That's the day's news.", font=fonts.get(80, bold=True),
+           fill=WHITE)
     d.rectangle([LEFT, 840, LEFT + 120, 848], fill=RED)
     d.text((LEFT, 900), f"Follow @{handle}" if handle else "Follow us", font=fonts.get(64, bold=True), fill=WHITE)
     d.text((LEFT, 990), "for the news that matters, every day", font=fonts.get(44), fill=GREY)
@@ -152,21 +156,16 @@ def outro(handle: str, brand: str, fonts: Fonts) -> Segment:
     return Segment(OUTRO, _static(bg), layer)
 
 
-def render(rows: list, date_label: str, handle: str, brand: str, fonts: Fonts, out: Path) -> Image.Image:
+def render(rows: list, date_label: str, handle: str, brand: str, fonts: Fonts, out: Path,
+           today: bool = True) -> Image.Image:
     """Write the video to `out`; returns the cover image (the intro card, fully drawn)."""
-    import imageio_ffmpeg
-
-    segments = [intro(len(rows), date_label, brand, fonts)]
+    segments = [intro(len(rows), date_label, brand, fonts, today)]
     segments += [story(r, n, len(rows), fonts) for n, r in enumerate(rows, 1)]
-    segments.append(outro(handle, brand, fonts))
+    segments.append(outro(handle, brand, fonts, today))
     starts = [sum(s.seconds for s in segments[:i]) for i in range(len(segments))]
     total = sum(s.seconds for s in segments)
     out.parent.mkdir(parents=True, exist_ok=True)
-    ff = subprocess.Popen(
-        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-         "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-         "-shortest", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-movflags", "+faststart", str(out)], stdin=subprocess.PIPE)
+    ff = subprocess.Popen(encoder_command(out, total), stdin=subprocess.PIPE)
     try:
         for f in range(int(total * FPS)):
             t = f / FPS
@@ -188,12 +187,26 @@ def render(rows: list, date_label: str, handle: str, brand: str, fonts: Fonts, o
                     fill = 1.0 if k < i - 1 else (min(1.0, (t - starts[i]) / STORY) if k == i - 1 else 0.0)
                     d.rectangle([x0, 60, x0 + seg, 66], fill=(90, 94, 104))
                     d.rectangle([x0, 60, x0 + seg * fill, 66], fill=WHITE)
-            ff.stdin.write(img.tobytes())
+            ff.stdin.write(img.resize((OUT_W, OUT_H), Image.BILINEAR).tobytes())
     finally:
         ff.stdin.close()
         if ff.wait() != 0:
             raise RuntimeError("ffmpeg could not encode the recap video")
     return segments[0].frame(segments[0].seconds)
+
+
+def encoder_command(out: Path, seconds: float) -> list[str]:
+    """ffmpeg with its memory bounded: at defaults it took ~1.5 GB for a 40-second 1080p video and the
+    server killed the whole service; this takes ~260 MB. One thread, a short lookahead, a small input
+    queue, and a silent track of a fixed length (no -shortest, which buffers)."""
+    import imageio_ffmpeg
+
+    return [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}", "-r", str(FPS), "-thread_queue_size", "2",
+            "-i", "-", "-f", "lavfi", "-t", f"{seconds:.2f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-filter_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-threads", "1",
+            "-x264-params", "rc-lookahead=5:sync-lookahead=0:ref=2", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-movflags", "+faststart", str(out)]
 
 
 def hashtags(rows: list) -> list[list[str]]:
