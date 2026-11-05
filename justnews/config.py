@@ -85,6 +85,9 @@ class Settings:
     gemini_content_models: list[str] = field(default_factory=lambda: _list(
         "GEMINI_CONTENT_MODELS", ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]))
     gemini_content_thinking_level: str = field(default_factory=lambda: os.getenv("GEMINI_CONTENT_THINKING_LEVEL", "low"))
+    # Paid fallback after the free Gemini models (daily quota used up, overloaded): this Claude model
+    # writes the posts and reads WhatsApp chat. Needs CLAUDE_API_KEY; "off" disables it.
+    claude_fallback_model: str = field(default_factory=lambda: os.getenv("JUSTNEWS_CLAUDE_FALLBACK_MODEL", "claude-haiku-5-5"))
     # Minimum gap between Gemini requests, to stay under free-tier requests-per-minute limits.
     gemini_min_interval: float = field(default_factory=lambda: _float("GEMINI_MIN_INTERVAL_SECONDS", 6.0))
     max_posts_per_run: int = field(default_factory=lambda: _int("JUSTNEWS_MAX_POSTS_PER_RUN", 10))

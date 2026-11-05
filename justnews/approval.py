@@ -83,7 +83,8 @@ class ApprovalService:
                  owner: str | None = None, assistant=None,
                  publishers: dict[str, Callable[[str, list[str]], object]] | None = None,
                  researcher: Callable[..., None] | None = None,
-                 editor: Callable[[str, list[str], str], dict[str, str]] | None = None):
+                 editor: Callable[[str, list[str], str], dict[str, str]] | None = None,
+                 next_cycle: Callable[[], datetime] | None = None):
         self.settings = settings
         self.db = db
         self.client = client
@@ -96,6 +97,8 @@ class ApprovalService:
         self.researcher = researcher
         # (run_id, article ids, the owner's instruction) -> {article id: the writer's reply}: rewrites posts.
         self.editor = editor
+        # () -> when the next scheduled shortlist is due (UTC), for "where's the update?"
+        self.next_cycle = next_cycle
 
     # --- outgoing ---------------------------------------------------------------
     def request(self, run_id: str, title: str | None = None, limit: int | None = None) -> dict:
@@ -282,6 +285,8 @@ class ApprovalService:
                          "template_ready": bool(s["template"]), "posted_to": s["posted"]}
                         for n, s in stories.items()],
         }
+        if self.next_cycle:
+            context["next_shortlist_at"] = self._next_update()
         if not stories:
             context["note"] = "No shortlist in the last 48 hours; the next one comes with the next news cycle."
         out = self.assistant.interpret(text, context) if self.assistant else fallback(text)
@@ -290,7 +295,7 @@ class ApprovalService:
         if intent == "send_templates":
             return self._send_templates(stories, numbers, reply)
         if intent == "show_shortlist" and req is not None:
-            self._send_shortlist(req["id"]) if open_req is not None else self._send(self._summary(stories))
+            self._send_shortlist(req["id"]) if open_req is not None else self._send(self._status(stories))
             return "shortlist sent"
         if intent == "approve" and open_req is not None and numbers:
             self.db.set_pending_approval(open_req["id"], numbers)
@@ -305,8 +310,8 @@ class ApprovalService:
             return self._approve(open_req, [], text)
         if intent == "edit":
             return self._edit(req, stories, numbers, out.get("instruction") or text, msg)
-        if intent == "status":
-            return self._reply(reply or self._summary(stories), "status")
+        if intent == "status":  # facts, not the model's words: it once answered "Checking now!" and did nothing
+            return self._reply(self._status(stories), "status")
         if intent == "research":
             query = out.get("query") or text
             if self.researcher is None:
@@ -353,13 +358,18 @@ class ApprovalService:
                        f"Reply with {'that number' if one else 'those numbers'} if you want {'it' if one else 'them'}.")
         return f"sent templates {to_send}"
 
-    @staticmethod
-    def _summary(stories: dict[int, dict]) -> str:
+    def _next_update(self) -> str:
+        return local_time(self.settings, self.next_cycle())
+
+    def _status(self, stories: dict[int, dict]) -> str:
+        """What's waiting, and when the next shortlist comes."""
+        nxt = f"The next news update comes at about {self._next_update()}." if self.next_cycle \
+            else "The next shortlist comes with the next news cycle."
         if not stories:
-            return "Nothing's waiting right now. The next shortlist comes with the next news cycle."
+            return f"Nothing's waiting right now. {nxt}"
         lines = [f"{n}. {s['headline']}: {s['approval']}" + (", template ready" if s["template"] else "")
                  for n, s in stories.items()]
-        return "Here's where things stand:\n" + "\n".join(lines)
+        return "Here's where things stand:\n" + "\n".join(lines) + f"\n\n{nxt}"
 
     def _reply(self, text: str, outcome: str) -> str:
         self._send(text)

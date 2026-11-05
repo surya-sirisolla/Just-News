@@ -149,5 +149,41 @@ class TopicTests(Base):
             "SELECT category FROM articles WHERE id = ?", (self.ids[1],)).fetchone()[0])  # older posts: the feed's
 
 
+class ClaudeFallbackTests(Base):
+    def test_claude_comes_after_the_free_models_and_can_be_turned_off(self):
+        from dataclasses import replace
+        from justnews.llm import ClaudeClient, GeminiClient, claude_fallback
+        s = replace(self.settings, gemini_api_key="g", claude_api_key="c", claude_fallback_model="claude-haiku-5-5")
+        clients = ContentCreatorAgent(s, self.db, verifier=False).clients
+        self.assertTrue(all(isinstance(c, GeminiClient) for c in clients[:-1]))
+        self.assertIsInstance(clients[-1], ClaudeClient)
+        self.assertEqual((clients[-1].model, clients[-1].usage.price_input_per_m), ("claude-haiku-5-5", 0.10))
+        self.assertEqual(claude_fallback(replace(s, claude_fallback_model="off")), [])
+        self.assertEqual(claude_fallback(replace(s, claude_api_key="")), [])
+
+    def test_claude_gets_its_turn_even_when_the_free_models_used_the_time_budget(self):
+        from dataclasses import replace
+        from justnews.llm import GeminiClient, LLMError
+        gemini = mock.Mock(spec=GeminiClient, model="gemini-x")
+        gemini.generate_json.side_effect = LLMError("daily free-tier quota exhausted")
+        paid = FakeModel({"write": {"posts": [draft("P1")]}})
+        agent = ContentCreatorAgent(replace(self.settings, gemini_content_time_budget=0), self.db,
+                                    clients=[gemini, gemini, paid], verifier=False)
+        from justnews.agents.content import ContentResult
+        keys = {"P1": {**dict(self.db.conn.execute("SELECT * FROM articles LIMIT 1").fetchone()), "fresh": True}}
+        drafts, model = agent._write(keys, ContentResult("r1"))
+        self.assertEqual(list(drafts), ["P1"])
+        self.assertEqual(model, paid.model)
+        gemini.generate_json.assert_not_called()  # out of time: the free models are skipped, the paid one runs
+
+    def test_claude_schemas_are_closed_objects(self):
+        from justnews.agents.content import RESPONSE_SCHEMA
+        from justnews.llm import _closed
+        closed = _closed(RESPONSE_SCHEMA)
+        self.assertIs(closed["additionalProperties"], False)
+        self.assertIs(closed["properties"]["posts"]["items"]["additionalProperties"], False)
+        self.assertNotIn("additionalProperties", RESPONSE_SCHEMA)  # Gemini's copy is untouched
+
+
 if __name__ == "__main__":
     unittest.main()

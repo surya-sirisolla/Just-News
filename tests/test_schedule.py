@@ -126,6 +126,36 @@ class SchedulerTests(unittest.TestCase):
             self.assertGreater(cli.seconds_until_due(db, 60), 59 * 60)
             db.conn.close()
 
+    def test_a_research_request_does_not_push_the_hourly_cycle_back(self):
+        import tempfile
+        from pathlib import Path
+        from justnews.db import Database
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "t.db")
+            db.create_run("20261105-023002")
+            db.create_run("20261105-024529-research")
+            db.conn.execute("UPDATE runs SET started_at = ? WHERE run_id = ?", ("2026-11-05T02:30:00+00:00", "20261105-023002"))
+            db.conn.execute("UPDATE runs SET started_at = ? WHERE run_id = ?", ("2026-11-05T02:45:00+00:00", "20261105-024529-research"))
+            db.conn.commit()
+            self.assertEqual(db.latest_run_id(scheduled=True), "20261105-023002")
+            with mock.patch("justnews.cli.datetime", wraps=datetime) as dt:
+                dt.now.return_value = utc("2026-11-05T03:14:00")
+                self.assertAlmostEqual(cli.seconds_until_due(db, 60), 16 * 60, delta=1)  # due at 03:30, not 03:45
+            db.conn.close()
+
+
+class StatusTests(Base):
+    def test_where_is_the_update_gets_the_real_next_time_not_a_promise(self):
+        self.service.request("r1")
+        self.service.settings = replace(self.service.settings, timezone="Asia/Kolkata")
+        self.service.next_cycle = lambda: utc("2026-11-05T03:30:00")
+        self.service.assistant = mock.Mock(interpret=lambda text, ctx: {
+            "intent": "status", "numbers": [], "instruction": "", "query": "", "reply": "Checking the latest updates now!"})
+        self.assertEqual(self.say("Where hourly update...?"), "status")
+        reply = self.outbox()[-1]
+        self.assertNotIn("Checking", reply)
+        self.assertIn("The next news update comes at about 9:00 AM.", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

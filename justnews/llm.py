@@ -25,6 +25,8 @@ log = logging.getLogger("justnews.llm")
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Request rejected for a reason a retry cannot fix (bad key, model, billing or request).
 FATAL_STATUS = (400, 401, 402, 403, 404)
+# Claude list prices (USD per 1M input, output tokens), for the usage report.
+PROVIDER_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.00, 10.00), "claude-opus-5-5": (4.00, 20.00)}
 
 
 class LLMError(Exception):
@@ -53,6 +55,19 @@ class Usage:
                 "cost_usd": round(self.cost_usd, 6)}
 
 
+def _closed(schema):
+    """The schema with additionalProperties false on every object, which Claude's structured
+    outputs require (the shared schemas leave it out, as Gemini doesn't need it)."""
+    if isinstance(schema, list):
+        return [_closed(s) for s in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: _closed(v) for k, v in schema.items()}
+    if out.get("type") == "object":
+        out.setdefault("additionalProperties", False)
+    return out
+
+
 class ClaudeClient:
     def __init__(self, api_key: str, model: str, price_input_per_m: float, price_output_per_m: float,
                  effort: str = "low", base_url: str = "https://api.anthropic.com",
@@ -73,7 +88,7 @@ class ClaudeClient:
                 max_tokens=self.max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
-                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": schema}},
+                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": _closed(schema)}},
             )
         except anthropic.APIStatusError as exc:
             self.usage.failed_calls += 1
@@ -212,6 +227,16 @@ class GeminiClient:
         if not text:
             raise LLMError(f"empty response (finishReason={candidates[0].get('finishReason')})")
         return json.loads(text)
+
+
+def claude_fallback(settings, timeout: float = 60.0) -> list[ClaudeClient]:
+    """The paid Claude model tried after the free Gemini ones, or none (no key, or turned off)."""
+    model = settings.claude_fallback_model
+    if not settings.claude_api_key or model in ("", "off"):
+        return []
+    prices = PROVIDER_PRICES.get(model, (0.0, 0.0))
+    return [ClaudeClient(settings.claude_api_key, model, *prices, effort="low",
+                         base_url=settings.claude_base_url, max_tokens=16000, timeout=timeout)]
 
 
 def make_llm_client(settings) -> ClaudeClient | GeminiClient:

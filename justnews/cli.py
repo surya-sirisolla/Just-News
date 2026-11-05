@@ -43,7 +43,7 @@ from .whatsapp import Incoming, OutboxClient, WhatsAppBridge, WhatsAppError, bri
 from .config import settings
 from .db import Database
 from .graphics import Fonts
-from .llm import GeminiClient, LLMError
+from .llm import GeminiClient, LLMError, claude_fallback
 from .logging_setup import setup_logging
 from . import recap
 from .agents.publisher import merge_hashtags
@@ -153,7 +153,8 @@ def approval_service(db: Database) -> ApprovalService:
     if settings.gemini_api_key:
         assistant = Assistant([GeminiClient(settings.gemini_api_key, m, 0.0, 0.0, thinking_level="minimal",
                                             min_interval=settings.gemini_min_interval, temperature=0.6,
-                                            timeout=20, retries=0) for m in settings.gemini_chat_models])
+                                            timeout=20, retries=0) for m in settings.gemini_chat_models]
+                              + claude_fallback(settings, timeout=30))
     publishers = {p.label: (lambda run_id, ids, p=p: p.publish(run_id, ids)) for p in make_publishers(db)}
 
     def editor(run_id: str, article_ids: list[str], instruction: str) -> dict[str, str]:
@@ -161,7 +162,7 @@ def approval_service(db: Database) -> ApprovalService:
 
     if settings.whatsapp_enabled:
         return ApprovalService(settings, db, OutboxClient(db), designer, assistant=assistant, publishers=publishers,
-                               researcher=start_research, editor=editor)
+                               researcher=start_research, editor=editor, next_cycle=lambda: next_cycle_at(db))
     log.warning("WHATSAPP_OWNER_NUMBER is not set; approval messages are printed here instead")
     return ApprovalService(settings, db, ConsoleClient(), designer, owner="console", assistant=assistant,
                            publishers=publishers, editor=editor,
@@ -474,13 +475,22 @@ def utcnow() -> datetime:
 
 
 def seconds_until_due(db: Database, every_minutes: int) -> float:
-    """Time left until the next cycle, counted from the last one, so a restart or deploy doesn't
-    send an extra shortlist."""
-    last = db.latest_run_id()
+    """Time left until the next cycle, counted from the last scheduled one, so a restart or deploy
+    doesn't send an extra shortlist (and a research request doesn't push the hourly one back)."""
+    last = db.latest_run_id(scheduled=True)
     if not last:
         return 0.0
     elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(db.get_run(last)["started_at"])).total_seconds()
     return max(0.0, every_minutes * 60 - elapsed)
+
+
+def next_cycle_at(db: Database, every_minutes: int | None = None) -> datetime:
+    """When the next scheduled shortlist is due (UTC): an hour after the last one, or after quiet hours."""
+    due = utcnow() + timedelta(seconds=seconds_until_due(db, every_minutes or CYCLE_MINUTES))
+    return quiet_until(settings, due) or due
+
+
+CYCLE_MINUTES = 60  # serve --every
 
 
 def scheduler(every_minutes: int, stop: threading.Event) -> None:
@@ -509,6 +519,8 @@ def cmd_serve(db: Database, args) -> str:
     """The production service: WhatsApp bridge plus an hourly news cycle, in one process."""
     if not settings.whatsapp_enabled:
         raise SystemExit("Set WHATSAPP_OWNER_NUMBER in .env first.")
+    global CYCLE_MINUTES
+    CYCLE_MINUTES = args.every
     stop = threading.Event()
     threading.Thread(target=scheduler, args=(args.every, stop), name="scheduler", daemon=True).start()
     if settings.x_enabled:

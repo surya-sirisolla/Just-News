@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 from ..config import Settings
 from ..db import Database
-from ..llm import GeminiClient, LLMError
+from ..llm import GeminiClient, LLMError, claude_fallback
 from ..plain import draft_notes, summary as plain_summary
 from ..regions import select_mix
 
@@ -272,7 +272,7 @@ class ContentCreatorAgent:
                                     thinking_level=settings.gemini_content_thinking_level,
                                     min_interval=settings.gemini_min_interval, temperature=0.4,
                                     timeout=45, retries=1)
-                       for m in settings.gemini_content_models]
+                       for m in settings.gemini_content_models] + claude_fallback(settings)
         self.clients = clients
         self.verifier = verifier if verifier is not None else self._default_verifier()
 
@@ -375,9 +375,9 @@ class ContentCreatorAgent:
                   "\n\nARTICLES:\n" + json.dumps(self._items(keys), ensure_ascii=False, indent=0))
         deadline = time.monotonic() + self.settings.gemini_content_time_budget
         for client in self.clients:
-            if time.monotonic() > deadline:
-                log.warning("  content time budget used up; remaining models skipped")
-                break
+            if time.monotonic() > deadline and isinstance(client, GeminiClient):
+                log.warning("  content time budget used up; %s skipped", client.model)
+                continue  # the paid fallback still gets its turn
             try:
                 rows = client.generate_json(SYSTEM_PROMPT, prompt, RESPONSE_SCHEMA).get("posts", [])
                 log.info("  %s wrote %d posts", client.model, len(rows))
@@ -386,7 +386,7 @@ class ContentCreatorAgent:
                 result.error = str(exc)
                 # Unavailable model, daily quota used up, timeouts or overload: try the next free model.
                 log.warning("  %s failed (%s); trying the next model", client.model, str(exc)[:160])
-        log.error("  no Gemini model could write posts; they stay pending for the next run")
+        log.error("  no model could write posts; they stay pending for the next run")
         return {}, ""
 
     def _revise(self, run_id: str, keys: dict, drafts: dict[str, dict], notes: dict[str, str],

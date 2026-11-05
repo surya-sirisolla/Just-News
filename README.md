@@ -76,7 +76,11 @@ so Agent 3:
   asks on per-minute 429s;
 - moves to the next model in `GEMINI_CONTENT_MODELS` on timeouts, 503 "high demand" or an
   exhausted daily quota;
-- stops after `GEMINI_CONTENT_TIME_BUDGET` seconds and leaves posts pending for the next run.
+- after the free models, falls back to a paid Claude model (`JUSTNEWS_CLAUDE_FALLBACK_MODEL`,
+  default `claude-haiku-5-5`, about $0.0005 a run; `off` disables it). The WhatsApp chat uses the
+  same fallback;
+- stops trying the free models after `GEMINI_CONTENT_TIME_BUDGET` seconds (the Claude fallback still
+  runs) and leaves posts pending for the next run if nothing answered.
 
 Free-tier prompts may be used by Google to improve its products. They contain only public news.
 

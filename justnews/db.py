@@ -253,8 +253,10 @@ class Database:
             "strategy": json.loads(row["strategy"]) if row["strategy"] else None,
         }
 
-    def latest_run_id(self) -> str | None:
-        row = self.conn.execute("SELECT run_id FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1").fetchone()
+    def latest_run_id(self, scheduled: bool = False) -> str | None:
+        """The newest run; `scheduled` skips research runs the owner asked for (they don't move the hourly clock)."""
+        where = "WHERE run_id NOT LIKE '%-research'" if scheduled else ""
+        row = self.conn.execute(f"SELECT run_id FROM runs {where} ORDER BY started_at DESC, run_id DESC LIMIT 1").fetchone()
         return row["run_id"] if row else None
 
     # --- articles ---------------------------------------------------------
