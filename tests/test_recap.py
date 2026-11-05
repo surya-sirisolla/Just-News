@@ -103,7 +103,8 @@ class RecapTests(unittest.TestCase):
             self.assertEqual(cli.post_recap(self.db, self.day), "posted https://ig/reel/1")
             self.assertTrue(cli.post_recap(self.db, self.day).startswith("already done"))
         self.assertEqual(len(posted), 1)
-        self.assertEqual(posted[0][0], f"recaps/{self.day}")
+        self.assertEqual(posted[0][0], f"posts/recaps/{self.day}")  # under posts/, which the server may write
+        self.assertTrue(cli.post_recap(self.db, self.day, force=True).startswith("already done"))  # never re-posted
         self.assertIn("1. Headline 1", posted[0][1])
         outbox = [r[0] for r in self.db.conn.execute("SELECT body FROM wa_outbox")]
         self.assertEqual(outbox, ["🎬 Today's recap Reel is up: 3 stories in one video.\nhttps://ig/reel/1"])
@@ -116,6 +117,9 @@ class RecapTests(unittest.TestCase):
             for _ in range(3):
                 cli.post_recap(self.db, day)
         self.assertTrue(self.db.get_state(f"recap:{day}").startswith("failed"))
+        self.assertEqual(cli.post_recap(self.db, day), f"already done ({self.db.get_state(f'recap:{day}')})")
+        with mock.patch.object(cli, "make_recap", return_value=None):
+            self.assertEqual(cli.post_recap(self.db, day, force=True), "skipped: fewer than two stories posted")
         outbox = [r[0] for r in self.db.conn.execute("SELECT body FROM wa_outbox")]
         self.assertEqual(len(outbox), 1)  # one message, after the last attempt
         self.assertIn("couldn't be posted", outbox[0])

@@ -358,11 +358,13 @@ def make_recap(db: Database, day: str, out_dir) -> tuple[list, str, object] | No
     return rows, str(video), cover
 
 
-def post_recap(db: Database, day: str) -> str:
-    """Make and post the day's recap Reel once; tells the owner on WhatsApp. Returns what happened."""
+def post_recap(db: Database, day: str, force: bool = False) -> str:
+    """Make and post the day's recap Reel once; tells the owner on WhatsApp. Returns what happened.
+    `force` retries a day that failed or was skipped; a posted recap is never posted again."""
     key = f"recap:{day}"
-    if db.get_state(key):
-        return f"already done ({db.get_state(key)})"
+    done = db.get_state(key)
+    if done and not (force and done.startswith(("failed", "skipped"))):
+        return f"already done ({done})"
     tries = int(db.get_state(f"{key}:attempts") or 0) + 1
     db.set_state(f"{key}:attempts", str(tries))
     notify = (lambda text: OutboxClient(db).send_text(settings.whatsapp_owner, text)) if settings.whatsapp_enabled \
@@ -376,7 +378,8 @@ def post_recap(db: Database, day: str) -> str:
         date_label = datetime.fromisoformat(day).strftime("%-d %b %Y")
         tags = merge_hashtags(recap.hashtags(rows))
         media_id, link = InstagramPublisher(settings, db).publish_reel(
-            f"recaps/{day}", Path(video).read_bytes(), cover, recap.caption(rows, date_label, tags, day == local_today()))
+            f"posts/recaps/{day}", Path(video).read_bytes(), cover,  # posts/: the prefix the server may write
+            recap.caption(rows, date_label, tags, day == local_today()))
     except Exception as exc:
         log.exception("Daily recap failed (attempt %d)", tries)
         if tries >= RECAP_ATTEMPTS:
@@ -432,7 +435,7 @@ def cmd_recap(db: Database, args) -> str:
         print(json.dumps({"day": day, "video": made[1] if made else None,
                           "stories": [r["headline"] for r in made[0]] if made else []}, indent=2))
         return ""
-    print(json.dumps({"day": day, "result": post_recap(db, day)}, indent=2))
+    print(json.dumps({"day": day, "result": post_recap(db, day, force=args.force)}, indent=2))
     return ""
 
 
@@ -531,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("recap", help="post the day's recap Reel now (--dry-run: only make the video)")
     p.add_argument("--day", default=None, help="YYYY-MM-DD, default today")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true", help="retry a day whose recap failed (never re-posts one)")
     p.set_defaults(func=cmd_recap)
     p = sub.add_parser("research", help='search the news on a topic and send a shortlist, e.g. research "AQI today"')
     p.add_argument("topic")
